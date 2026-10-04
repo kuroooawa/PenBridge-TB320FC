@@ -39,7 +39,7 @@ NOTICE.md                     出处、致谢、第三方材料说明
 ```
 
 ## 安装
-
+**TB320FC 请确认使用卡鱼大佬的 ColorOS 16.0.10.500**
 1. **先卸载旧 Hook**（签名换了，不卸载无法覆盖安装）：
    `adb uninstall com.aclaniakea.lenovopenbridge`
 2. KernelSU 安装 `dist/PenBridge-Module-v4.1.3-TB320FC.zip`；
