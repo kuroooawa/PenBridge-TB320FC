@@ -1,5 +1,5 @@
 # PenBridge TB320FC / AP501U 构建
-
+本项目全程由deepseek4.1flash构建
 把 [ACLaniakea/coloros-pad-fixes](https://github.com/ACLaniakea/coloros-pad-fixes) 发布的
 **PenBridge-Module v4.1.3**（联想手写笔桥接 KernelSU 模块 + LSPosed Hook）适配到
 **联想拯救者 Y700 二代 / Legion Tab（TB320FC）**，并把配套手写笔型号标定为
