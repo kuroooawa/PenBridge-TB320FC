@@ -1,0 +1,16 @@
+# 上游产物放这里（不入库）：PenBridge-Module-v4.1.3.zip / PenBridge-Hook.apk（未打补丁）
+upstream/*
+!upstream/.gitkeep
+
+# 构建中间产物、密钥、日志
+build/
+keys/
+*.jks
+*.p12
+*.keystore
+*.log
+__pycache__/
+*.pyc
+
+# 解包出来的上游模块树（tools/diff_module.py、tools/shell_balance.py 用）
+upstream/module-upstream/

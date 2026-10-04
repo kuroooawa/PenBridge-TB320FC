@@ -1,0 +1,1506 @@
+#!/system/bin/sh
+
+MODDIR=${0%/*}
+
+# ============================================================================
+# 联想手写笔桥接 Root 服务 · service（开机完成后）阶段
+# 实际修复与作用：
+#   1) 开机按已绑定手写笔地址直接调用原厂 CoreService 的 CONNECT_PENCIL
+#      BLE 连接（不以 Hall/CPS 为前提），并做有限次重试；
+#   2) 设置页断开时调用 DISCONNECT_PENCIL，由配套 LSPosed Hook 执行
+#      BluetoothGatt.disconnect()，使设备/HID 真实离开连接态；
+#   3) 常驻监控真实 ACL/GATT/Hall/CPS 事件，驱动 ColorOS 设置页手写笔
+#      卡片、磁吸胶囊、电量与存在状态（状态只跟随真实事件，不强行回放）；
+#   4) CPS 开机上电：仅在真实磁吸 Hall 对为 0:1 时保持 CPS GPIO，磁吸只
+#      负责充电与弹窗；不使用自定义内核模块；
+#   5) PenHidCtl（priv-app HID 控制器）开机授予蓝牙运行时权限，只调后台
+#      PenHidService，无启动器入口；
+#   6) 不监听屏幕状态、不做唤醒回放：状态只跟随真实 Hall/GATT/Root 事件。
+#      早期版本在唤醒后延迟回放过一次，那是为了绕开"唤醒瞬间写 DSI/panel 节点
+#      导致黑屏"；后来改成 pen_wakeup_* 只在开机按需写一次，回放就没必要了，
+#      代码也早已删除（本文件里搜不到任何屏幕状态监听）。
+#   7) 刷新率策略由 post-fs-data 绑定，本服务不管理亮度/背光/屏幕电源。
+# 生效设备：TB320FC（联想拯救者 Y700 二代 / Legion Tab）；配套手写笔：联想 AP501U
+# （Lenovo Tab Pen Plus，Picasso/LPP）。Hook 仍独立安装，模块内签名副本
+# 仅用于 LSPosed 在 PackageManager 恢复 /data/app 前稳定读取。
+# ============================================================================
+
+LOGFILE="$MODDIR/pen-bridge.log"
+MODE=/proc/pen_wakeup_mode
+SWITCH=/proc/pen_wakeup_switch
+UEVENT=/sys/devices/virtual/lenovo_penraw/lenovo_penraw/uevent
+PEN1_HALL=/sys/devices/virtual/factory/interface/hw_info/pen1_hall
+PEN2_HALL=/sys/devices/virtual/factory/interface/hw_info/pen2_hall
+CPS_GPIOCHIP=gpiochip0
+CPS_GPIODEV=/dev/gpiochip0
+CPS_GPIOSET=/system/bin/gpioset
+CPS_HELPER="$MODDIR/bin/pen-cps-gpio"
+CPS_PEN_HALL=/sys/devices/virtual/factory/interface/hw_info/pen2_hall
+CPS_UEVENT=/sys/devices/platform/soc/9c0000.qcom,qupv3_i2c_geni_se/98c000.i2c/i2c-2/2-0041/uevent
+CPS_PIDFILE="$MODDIR/cps-gpio.pid"
+CPS_DISABLED="$MODDIR/disable"
+HALL_STATE_FILE="$MODDIR/pen-hall.state"
+CAPSULE_DEDUP_FILE="$MODDIR/pen-capsule.last"
+CAPSULE_DEDUP_SECONDS=4
+SERVICE_LOCK="$MODDIR/.service.lock"
+HIDCTL_SERVICE=com.aclaniakea.penhidctl/.PenHidService
+OEM_CORE_SERVICE=com.oplus.ipemanager/.btadsorb.CoreService
+OEM_CONNECT_ACTION=com.oplus.ipemanager.action.CONNECT_PENCIL
+OEM_DISCONNECT_ACTION=com.oplus.ipemanager.action.DISCONNECT_PENCIL
+PEN_CONNECT_DEDUP_FILE="$MODDIR/pen-connect.last"
+PEN_BOOT_READY_FILE="$MODDIR/pen-boot-ready"
+HIDCTL_PERMISSION_FILE="$MODDIR/pen-hid-permissions.ready"
+BRIDGE_PERMISSION_FILE="$MODDIR/pen-bridge-permissions.ready"
+HIDCTL_LAUNCHER_FILE="$MODDIR/pen-hid-launcher.hidden"
+PEN_USER_DISCONNECT_KEY=lenovo_pen_user_disconnect_requested
+
+# 配套手写笔型号：联想 AP501U（商品名 Lenovo Tab Pen Plus，Picasso / LPP+USI2.0）。
+# PEN_MODEL_NAME 随状态广播的 name 附加项发布，ColorOS 设置页/设备空间用它显示笔名；
+# PEN_MODEL_KEYWORDS 只用于在已配对设备里识别这支笔（大小写不敏感，另见 pen_name_matches）。
+PEN_MODEL_NAME="Lenovo Tab Pen Plus (AP501U)"
+PEN_MODEL_KEYWORDS="ap501u ap500u tab pen plus picasso"
+
+# Respawn guard: if the real service exits (crash, OOM, kill), bring it
+# back after a short delay. KernelSU can invoke service.sh several times
+# during boot (module refresh, boot-completed callbacks), so only one
+# invocation may own the respawn loop and the monitors.
+#
+# The singleton lock is an exclusive flock on $SERVICE_LOCK held by the
+# first invocation's file descriptor. The descriptor is inherited by the
+# background respawn loop and by each service child, so exactly one loop
+# (and one monitor set) stays alive for the whole session. Later KernelSU
+# invocations fail the non-blocking lock and exit immediately. If the loop
+# dies, the descriptor closes, the lock is released, and a later invocation
+# takes over.
+if [ -z "$PEN_SERVICE_RESPAWN" ]; then
+    if [ -d "$SERVICE_LOCK" ]; then
+        # Legacy mkdir lock from older builds; replace it with the flock file.
+        rm -rf "$SERVICE_LOCK" 2>/dev/null
+    fi
+    exec 9>"$SERVICE_LOCK" 2>/dev/null || exit 0
+    if ! /data/adb/ksu/bin/busybox flock -n 9 2>/dev/null; then
+        # Either the lock is taken or busybox flock is unavailable; in both
+        # cases exit without running a second monitor set.
+        exit 0
+    fi
+    export PEN_SERVICE_RESPAWN=1
+    (
+        while [ ! -e "$CPS_DISABLED" ]; do
+            sh "$0"
+            sleep 8
+        done
+    ) &
+    exit 0
+fi
+
+# ============================================================================
+# 生效设备判定：TB320FC（联想拯救者 Y700 二代 / Legion Tab）
+#
+# 旧版本按 SoC/平台判定（ro.soc.model 含 SM8650Q + ro.board.platform 含
+# pineapple），那是小新 Pad Pro GT（TB710FU）的身份。TB320FC 是 SM8475
+# 平台，而且不同 ROM（原厂 ZUI / ColorOS 移植）上报的 soc/platform 取值
+# 未必一致，所以改成按机型身份属性判定：任一 ro.product.* 身份属性里出现
+# TB320FC 即认为跑在目标设备上。空属性不参与匹配。
+# 换目标设备只需要改下面 PEN_TARGET_DEVICE 一行。
+# ============================================================================
+PEN_TARGET_DEVICE=TB320FC
+DEVICE_MATCHED_PROP=
+
+device_matches_target() {
+    needle=$(printf '%s' "$PEN_TARGET_DEVICE" | tr 'a-z' 'A-Z')
+    [ -n "$needle" ] || return 1
+    for prop in \
+            ro.product.device \
+            ro.product.vendor.device \
+            ro.product.odm.device \
+            ro.product.product.device \
+            ro.product.system.device \
+            ro.product.system_ext.device \
+            ro.product.model \
+            ro.product.vendor.model \
+            ro.product.odm.model \
+            ro.product.product.model \
+            ro.product.name \
+            ro.product.board \
+            ro.build.product; do
+        value=$(getprop "$prop" 2>/dev/null | tr -d '\r' | tr 'a-z' 'A-Z')
+        [ -n "$value" ] || continue
+        case "$value" in
+            *"$needle"*)
+                DEVICE_MATCHED_PROP="$prop=$value"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+if ! device_matches_target; then
+    {
+        echo "unsupported device: target=$PEN_TARGET_DEVICE"
+        for prop in \
+                ro.product.device ro.product.model ro.product.name \
+                ro.soc.model ro.board.platform; do
+            printf '  %s=%s\n' "$prop" "$(getprop "$prop" 2>/dev/null | tr -d '\r')"
+        done
+    } >"$LOGFILE"
+    exit 0
+fi
+
+# 本服务把整个输出重定向进日志，模块目录在 /data/adb 下又没有任何外部轮转，
+# 此前是无限追加。开机先滚一次，保留上一轮现场；运行中由下面的
+# trim_log_if_large 兜底。exec >> 用的是 O_APPEND，所以就地截断是安全的：
+# 下一次写入仍从文件末尾（即 0）开始，不会产生空洞文件。
+LOG_MAX_BYTES=524288
+if [ -f "$LOGFILE" ]; then
+    mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null
+fi
+
+trim_log_if_large() {
+    size=$(wc -c <"$LOGFILE" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$size" -lt "$LOG_MAX_BYTES" ] && return 0
+    : >"$LOGFILE" 2>/dev/null
+    echo "[$(date '+%F %T')] log truncated at ${size}B (cap ${LOG_MAX_BYTES}B)"
+}
+
+exec >>"$LOGFILE" 2>&1
+echo "[$(date '+%F %T')] service start device=$DEVICE_MATCHED_PROP pen=$PEN_MODEL_NAME"
+
+# 不 fork 的等待。
+#
+# 每次调用外部 sleep 都是一次 fork+exec，而本服务有 6 处 1 秒轮询、3 处 2 秒
+# 轮询，外加若干子 shell。实测代价：笔桥接运行时全系统 26 forks/s，停掉它只剩
+# 8 forks/s——**它一个模块占了全系统进程创建的 69%**，而且笔没在使用时照跑不误
+# （10 个常驻 shell、合计 RSS 7.7 MB、持续约 1% CPU）。
+#
+# read 是 shell 内建命令。把一个只读不写的 fifo 以读写方式常开在 fd 8 上，
+# `read -t N -u 8` 就会阻塞到超时再返回，全程不创建进程。fifo 必须用 <> 打开，
+# 否则没有写端时 read 会立刻拿到 EOF 而不是等待。
+#
+# fd 用 8：9 已被上面的 SERVICE_LOCK 占用。
+# 自检失败（shell 不支持 read -t、fifo 建不出来、或立刻返回而不是等待）时
+# 原样回退到外部 sleep，行为与改动前完全一致。
+NAP_FIFO="$MODDIR/.nap.fifo"
+NAP_READY=0
+
+nap_init() {
+    [ -p "$NAP_FIFO" ] || {
+        rm -f "$NAP_FIFO" 2>/dev/null
+        mknod "$NAP_FIFO" p 2>/dev/null || mkfifo "$NAP_FIFO" 2>/dev/null
+    }
+    [ -p "$NAP_FIFO" ] || return 1
+    exec 8<>"$NAP_FIFO" 2>/dev/null || return 1
+    # 自检：请求等 0.3 秒，必须真的耗掉 >=200ms。若 shell 不支持 -t 或直接
+    # 拿到 EOF 就会立刻返回，那种情况下用它会把轮询变成忙等，必须回退。
+    _nap_t0=$(date +%s%N 2>/dev/null) || return 1
+    read -t 0.3 -u 8 _nap_discard 2>/dev/null
+    _nap_t1=$(date +%s%N 2>/dev/null) || return 1
+    [ $(( (_nap_t1 - _nap_t0) / 1000000 )) -ge 200 ] || return 1
+    NAP_READY=1
+    return 0
+}
+
+sleep_sec() {
+    if [ "$NAP_READY" = 1 ]; then
+        read -t "$1" -u 8 _nap_discard 2>/dev/null
+        return 0
+    fi
+    # Use the root runtime's BusyBox first.  On this ROM /system/bin/toybox can
+    # appear executable while its mount namespace is still settling; invoking it
+    # then fails and a polling loop can spin at 100% CPU.
+    for sleep_backend in \
+            /data/adb/ksu/bin/busybox \
+            /data/adb/magisk/busybox \
+            /system/bin/toybox; do
+        [ -x "$sleep_backend" ] || continue
+        if "$sleep_backend" sleep "$1" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    echo "[$(date '+%F %T')] no working sleep backend; stopping service to avoid a busy loop"
+    exit 0
+}
+
+if nap_init; then
+    echo "[$(date '+%F %T')] nap: 使用内建 read -t（不 fork）"
+else
+    echo "[$(date '+%F %T')] nap: 自检未通过，回退外部 sleep"
+fi
+
+count=0
+while { [ ! -e "$MODE" ] || [ ! -e "$SWITCH" ]; } && [ "$count" -lt 60 ]; do
+    sleep_sec 1
+    count=$((count + 1))
+done
+
+apply_pen_wake() {
+    mode=$(cat "$MODE" 2>/dev/null | tr -d '\r')
+    wake=$(cat "$SWITCH" 2>/dev/null | tr -d '\r')
+    mode_write=0
+    switch_write=0
+
+    # system_server cannot write these vendor proc nodes on this ROM.  The
+    # Root service is the only writer, and writes each node only when it is
+    # not already enabled.  This avoids the old repeated DSI/panel writes
+    # while still enabling the CPS pen-wakeup path once after boot.
+    if [ "$mode" != 1 ] && [ -w "$MODE" ]; then
+        if printf '1\n' >"$MODE" 2>/dev/null; then
+            mode_write=1
+        fi
+    fi
+    if [ "$wake" != 1 ] && [ -w "$SWITCH" ]; then
+        if printf '1\n' >"$SWITCH" 2>/dev/null; then
+            switch_write=1
+        fi
+    fi
+
+    mode=$(cat "$MODE" 2>/dev/null | tr -d '\r')
+    wake=$(cat "$SWITCH" 2>/dev/null | tr -d '\r')
+    echo "[$(date '+%F %T')] pen wake root apply mode=$mode switch=$wake wrote_mode=$mode_write wrote_switch=$switch_write"
+}
+
+# The CPS driver or vendor power manager can reset these proc switches after
+# boot. Keep the kernel wake path enabled while the module is active, but only
+# rewrite a node after observing that it has been turned off.
+monitor_pen_wake() {
+    while [ ! -e "$CPS_DISABLED" ]; do
+        mode=$(cat "$MODE" 2>/dev/null | tr -d '\r')
+        wake=$(cat "$SWITCH" 2>/dev/null | tr -d '\r')
+        if [ -n "$mode" ] && [ -n "$wake" ] && { [ "$mode" != 1 ] || [ "$wake" != "Pen Wakeup SWITCH 1!" ]; }; then
+            echo "[$(date '+%F %T')] pen wake node reset detected mode=$mode switch=$wake"
+            apply_pen_wake
+        fi
+        sleep_sec 30
+    done
+}
+
+# v1.0.61 wrote a connected snapshot immediately after requesting GATT.  That
+# snapshot could survive a module update and make the next boot look connected
+# even when Bluetooth had no live link.  Start this revision from a neutral
+# mirror; the OEM ACL/GATT and real Hall/CPS events repopulate it afterward.
+# Keep the explicit user disconnect choice and the last valid battery sample
+# intact. The operational latch is normalized separately at boot: an ACL
+# disconnect emitted during a normal reboot must not block the next boot.
+# Bluetooth recovery below is intentionally independent of the physical Hall
+# pair; Hall is only used by the CPS and magnetic-capsule paths.
+reset_pen_state_mirror() {
+    for key in \
+            lenovo_pen_link_connected \
+            ipe_pencil_connect_state \
+            ipe_pencil_connection_state \
+            PENCIL_CONNECT_STATE \
+            pencil_connect_state; do
+        settings put global "$key" 0 >/dev/null 2>&1
+    done
+    settings put global lenovo_pen_refresh_active 0 >/dev/null 2>&1
+    settings put global settings_enable_oppo_pencil 0 >/dev/null 2>&1
+    settings put global ipe_pencil_present 0 >/dev/null 2>&1
+    settings put global ipe_pencil_charging_state 0 >/dev/null 2>&1
+    settings put global lenovo_pen_physical_docked 0 >/dev/null 2>&1
+    settings put global lenovo_pen_hardware_battery_valid 0 >/dev/null 2>&1
+    settings put global lenovo_pen_oem_charge_valid 0 >/dev/null 2>&1
+    echo "[$(date '+%F %T')] stale v1.0.61 connection mirror cleared"
+}
+
+normalize_disconnect_latch() {
+    user_requested=$(settings get global "$PEN_USER_DISCONNECT_KEY" 2>/dev/null | tr -d '\r')
+    case "$user_requested" in
+        1|0) ;;
+        *) user_requested=0 ;;
+    esac
+    # lenovo_pen_disconnect_requested is a runtime guard. Do not carry a
+    # natural ACL shutdown from the previous boot into the next boot; only an
+    # explicit settings-page Disconnect is persistent across reboot.
+    settings put global "$PEN_USER_DISCONNECT_KEY" "$user_requested" >/dev/null 2>&1
+    settings put global lenovo_pen_disconnect_requested "$user_requested" >/dev/null 2>&1
+    echo "[$(date '+%F %T')] disconnect latch normalized user=$user_requested"
+}
+
+until [ "$(getprop sys.boot_completed)" = 1 ]; do
+    sleep_sec 2
+done
+normalize_disconnect_latch
+# OEM GATT readiness belongs to the current IPeManager process/session.  A
+# persisted value from the previous boot makes system_server broadcast haptic
+# commands to a dynamic receiver that no longer exists, suppressing the direct
+# GATT fallback.  The Hook writes the live owner PID after service discovery.
+settings put global lenovo_pen_oem_control_ready 0 >/dev/null 2>&1
+settings put global lenovo_pen_oem_control_pid 0 >/dev/null 2>&1
+settings put global lenovo_pen_oem_haptic_forward 1 >/dev/null 2>&1
+echo "[$(date '+%F %T')] stale OEM haptic transport session cleared"
+apply_pen_wake
+reset_pen_state_mirror
+monitor_pen_wake &
+
+# Priv-app allowlists do not grant Android 12+ Bluetooth runtime permissions.
+# Root only calls PenHidCtl's explicit service component. The APK has no
+# launcher intent, so authorize that service before issuing any HID command.
+grant_hidctl_bluetooth_permissions() {
+    [ -f "$HIDCTL_PERMISSION_FILE" ] && return 0
+    if [ -z "$(pm path com.aclaniakea.penhidctl 2>/dev/null)" ]; then
+        echo "[$(date '+%F %T')] HID permission grant skipped: helper APK unavailable"
+        return 0
+    fi
+    failed=0
+    for permission in \
+            android.permission.BLUETOOTH_CONNECT \
+            android.permission.BLUETOOTH_SCAN; do
+        if ! pm grant --user 0 com.aclaniakea.penhidctl "$permission" >/dev/null 2>&1; then
+            failed=1
+            echo "[$(date '+%F %T')] HID permission grant failed permission=$permission"
+        fi
+    done
+    if [ "$failed" = 0 ]; then
+        : >"$HIDCTL_PERMISSION_FILE"
+        echo "[$(date '+%F %T')] HID Bluetooth runtime permissions granted"
+    fi
+}
+
+# The haptic transport deliberately lives in the standalone bridge process so
+# a vendor Bluetooth failure cannot restart system_server. Package updates can
+# revoke nearby-device runtime grants, so make the isolation path self-healing.
+grant_bridge_bluetooth_permissions() {
+    [ -f "$BRIDGE_PERMISSION_FILE" ] && return 0
+    if [ -z "$(pm path com.aclaniakea.lenovopenbridge 2>/dev/null)" ]; then
+        echo "[$(date '+%F %T')] bridge permission grant skipped: Hook APK unavailable"
+        return 0
+    fi
+    failed=0
+    for permission in \
+            android.permission.BLUETOOTH_CONNECT \
+            android.permission.BLUETOOTH_SCAN; do
+        if ! pm grant --user 0 com.aclaniakea.lenovopenbridge "$permission" >/dev/null 2>&1; then
+            failed=1
+            echo "[$(date '+%F %T')] bridge permission grant failed permission=$permission"
+        fi
+    done
+    if [ "$failed" = 0 ]; then
+        : >"$BRIDGE_PERMISSION_FILE"
+        echo "[$(date '+%F %T')] bridge Bluetooth runtime permissions granted"
+    fi
+}
+
+# The bridge Hook APK has no launcher component, so a package (re)install or
+# force-stop leaves it in the stopped state. A stopped app's ContentProvider is
+# not resolvable from system_server, which silently drops every haptic dispatch
+# with "Failed to find provider info". Keep it un-stopped so the provider (and
+# therefore the writing haptic) is always reachable.
+unstop_bridge() {
+    if [ -z "$(pm path com.aclaniakea.lenovopenbridge 2>/dev/null)" ]; then
+        return 0
+    fi
+    if pm unstop --user 0 com.aclaniakea.lenovopenbridge >/dev/null 2>&1; then
+        echo "[$(date '+%F %T')] bridge Hook APK un-stopped (haptic provider reachable)"
+    fi
+}
+
+hide_hidctl_launcher() {
+    [ -f "$HIDCTL_LAUNCHER_FILE" ] && return 0
+    if [ -z "$(pm path com.aclaniakea.penhidctl 2>/dev/null)" ]; then
+        echo "[$(date '+%F %T')] HID launcher hide skipped: helper APK unavailable"
+        return 0
+    fi
+    if pm disable --user 0 com.aclaniakea.penhidctl/.MainActivity >/dev/null 2>&1; then
+        : >"$HIDCTL_LAUNCHER_FILE"
+        echo "[$(date '+%F %T')] HID launcher activity disabled"
+    else
+        echo "[$(date '+%F %T')] HID launcher activity disable deferred"
+    fi
+}
+
+retry_hidctl_setup() {
+    attempt=1
+    while [ "$attempt" -le 12 ] && [ ! -e "$CPS_DISABLED" ]; do
+        hide_hidctl_launcher
+        grant_hidctl_bluetooth_permissions
+        grant_bridge_bluetooth_permissions
+        unstop_bridge
+        [ -f "$HIDCTL_PERMISSION_FILE" ] && [ -f "$BRIDGE_PERMISSION_FILE" ] && return 0
+        sleep_sec 5
+        attempt=$((attempt + 1))
+    done
+    echo "[$(date '+%F %T')] HID setup retry window expired"
+}
+
+hide_hidctl_launcher
+grant_hidctl_bluetooth_permissions
+grant_bridge_bluetooth_permissions
+unstop_bridge
+retry_hidctl_setup &
+
+# The LSPosed Hook is a separate package now. This Root service deliberately
+# does not call pm install and never copies an APK into /data/app.
+echo "[$(date '+%F %T')] stable LSPosed Pen Hook payload expected"
+
+# The ported OplusBatteryManager reports wirelessPenPresent=0 even when the
+# real Hall pair is 0/1 (pen docked).  That makes the bridge's Java poller
+# classify every magnetic edge as undocked and the OEM Capsule is never
+# requested.  Read the two real Hall nodes in root context and feed the
+# already-installed ColorOS handoff/capsule receiver.  Battery and charging
+# still come from the CPS/GATT-backed settings and uevent; this monitor only
+# repairs the physical magnetic edge.
+read_hall_state() {
+    # This path is sampled once per second for physical attach/detach.  Using
+    # cat|tr here used to fork four short-lived processes for every sample
+    # (two readers plus two filters).  sysfs values are newline-terminated,
+    # so POSIX read returns the same value without a process launch.  Keep
+    # invalid/missing nodes represented as an empty value and let the existing
+    # state machine report -1 rather than fabricating a magnetic edge.
+    hall1=
+    hall2=
+    [ -r "$PEN1_HALL" ] && IFS= read -r hall1 <"$PEN1_HALL"
+    [ -r "$PEN2_HALL" ] && IFS= read -r hall2 <"$PEN2_HALL"
+    case "$hall1:$hall2" in
+        0:1|1:0|0:0) echo 1 ;; # docked (either orientation)
+        1:1) echo 0 ;; # detached
+        *) echo -1 ;;
+    esac
+}
+
+valid_level() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 0 ] && [ "$1" -le 100 ]
+}
+
+read_level_from_file() {
+    file="$1"
+    [ -r "$file" ] || return 0
+    for key in LEVEL BATTERY_LEVEL BATTERY_LEVEL_PERCENT BATTERY CAPACITY PEN_BATTERY; do
+        level=$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1 | tr -d '\r')
+        if valid_level "$level"; then
+            echo "$level"
+            return 0
+        fi
+    done
+}
+
+cache_hardware_battery() {
+    level="$1"
+    valid_level "$level" || return 0
+    # A CPS/HID read can be repeated by several monitors.  Settings writes
+    # wake SettingsProvider and IPeManager, so only publish an actual change.
+    current=$(settings get global ipe_pencil_battery_level 2>/dev/null | tr -d '\r')
+    [ "$current" = "$level" ] || \
+        settings put global ipe_pencil_battery_level "$level" >/dev/null 2>&1
+    current=$(settings get global lenovo_pen_last_valid_battery 2>/dev/null | tr -d '\r')
+    [ "$current" = "$level" ] || \
+        settings put global lenovo_pen_last_valid_battery "$level" >/dev/null 2>&1
+    current=$(settings get global lenovo_pen_hardware_battery_valid 2>/dev/null | tr -d '\r')
+    [ "$current" = 1 ] || \
+        settings put global lenovo_pen_hardware_battery_valid 1 >/dev/null 2>&1
+    now=$(date '+%s' 2>/dev/null)
+    case "$now" in
+        ''|*[!0-9]*) ;;
+        *) settings put global lenovo_pen_hardware_battery_last_at "$now" >/dev/null 2>&1 ;;
+    esac
+}
+
+suspect_unconnected_zero_battery() {
+    [ "$1" = 0 ] || return 1
+    connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+    [ "$connected" != 1 ]
+}
+
+read_hardware_battery() {
+    level=$(settings get global ipe_pencil_battery_level 2>/dev/null | tr -d '\r')
+    battery_valid=$(settings get global lenovo_pen_hardware_battery_valid 2>/dev/null | tr -d '\r')
+    if valid_level "$level" && [ "$battery_valid" = 1 ] \
+            && ! suspect_unconnected_zero_battery "$level"; then
+        echo "$level"
+        return 0
+    fi
+    level=$(read_level_from_file "$CPS_UEVENT")
+    # CPS exposes LEVEL=0 while the docked pen is only waiting to power up.
+    # A genuine 0% sample is still accepted from the live BLE/GATT cache, but
+    # a raw kernel/CPS zero is never promoted to trusted battery state.
+    connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+    if [ "$connected" = 1 ] && valid_level "$level" && [ "$level" -gt 0 ]; then
+        cache_hardware_battery "$level"
+        echo "$level"
+        return 0
+    fi
+    level=$(read_level_from_file "$UEVENT")
+    if [ "$connected" = 1 ] && valid_level "$level" && [ "$level" -gt 0 ]; then
+        cache_hardware_battery "$level"
+        echo "$level"
+        return 0
+    fi
+    # Never turn an unavailable sample into a new 0% value.  Keep the last
+    # hardware sample until the GATT link reports a fresh one.
+    level=$(settings get global lenovo_pen_last_valid_battery 2>/dev/null | tr -d '\r')
+    if valid_level "$level"; then
+        echo "$level"
+    else
+        echo -1
+    fi
+}
+
+read_charge_from_file() {
+    file="$1"
+    [ -r "$file" ] || return 0
+    for key in CHARGING_STATE CHARGING CHARGE_STATE WIRELESS_CHARGING; do
+        charge_state=$(sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1 | tr -d '\r')
+        case "$charge_state" in
+            1|Charging|charging|Charge|charge|WIRELESS_CHARGING|Wireless\ Charging)
+                echo 1
+                return 0
+                ;;
+            0|Full|full|Not\ charging|not_charging|Discharging|discharging|Idle|idle|None|none)
+                echo 0
+                return 0
+                ;;
+        esac
+    done
+}
+
+cache_hardware_charging() {
+    state="$1"
+    case "$state" in
+        0|1)
+            settings put global lenovo_pen_hardware_charge_state "$state" >/dev/null 2>&1
+            settings put global lenovo_pen_hardware_charge_valid 1 >/dev/null 2>&1
+            # Keep the OEM charging keys in sync with the CPS truth so the
+            # Hook handoff cannot override a fresh hardware sample with a
+            # stale BLE 2A1A value.
+            settings put global lenovo_pen_oem_charge_valid 1 >/dev/null 2>&1
+            settings put global lenovo_pen_oem_charge_state "$state" >/dev/null 2>&1
+            ;;
+    esac
+}
+
+read_attached_from_file() {
+    file="$1"
+    [ -r "$file" ] || return 0
+    sed -n 's/^ATTACHED=//p' "$file" 2>/dev/null | head -1 | tr -d '\r'
+}
+
+read_hardware_charging() {
+    docked="$1"
+    if [ "$docked" = 0 ]; then
+        # Hall is authoritative for physical charging. CPS ATTACHED and its
+        # charge byte can remain latched after removal; never mirror that
+        # stale state into the control-center widget or the next capsule.
+        cache_hardware_charging 0
+        echo 0
+        return 0
+    fi
+    charge_state=$(read_charge_from_file "$CPS_UEVENT")
+    attached=$(read_attached_from_file "$CPS_UEVENT")
+    case "$charge_state" in
+        0|1)
+            if [ "$charge_state" = 0 ] || { [ "$attached" = 1 ] || [ "$docked" = 1 ]; }; then
+                cache_hardware_charging "$charge_state"
+                echo "$charge_state"
+                return 0
+            fi
+            cache_hardware_charging 0
+            echo 0
+            return 0
+            ;;
+    esac
+    charge_state=$(read_charge_from_file "$UEVENT")
+    case "$charge_state" in
+        0|1)
+            cache_hardware_charging "$charge_state"
+            echo "$charge_state"
+            return 0
+            ;;
+    esac
+    charge_valid=$(settings get global lenovo_pen_hardware_charge_valid 2>/dev/null | tr -d '\r')
+    charge_state=$(settings get global lenovo_pen_hardware_charge_state 2>/dev/null | tr -d '\r')
+    if [ "$charge_valid" = 1 ] && { [ "$charge_state" = 0 ] || [ "$charge_state" = 1 ]; }; then
+        echo "$charge_state"
+        return 0
+    fi
+    charge_valid=$(settings get global lenovo_pen_oem_charge_valid 2>/dev/null | tr -d '\r')
+    charge_state=$(settings get global lenovo_pen_oem_charge_state 2>/dev/null | tr -d '\r')
+    if [ "$charge_valid" = 1 ] && { [ "$charge_state" = 0 ] || [ "$charge_state" = 1 ]; }; then
+        echo "$charge_state"
+    else
+        echo 0
+    fi
+}
+
+is_pen_mac() {
+    case "$1" in
+        00:00:00:00:00:00) return 1 ;;
+        [0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+normalize_pen_mac() {
+    raw=$(printf '%s' "$1" | tr -d '\r' | tr 'a-f' 'A-F')
+    case "$raw" in
+        [0-9A-F][0-9A-F]:[0-9A-F][0-9A-F]:[0-9A-F][0-9A-F]:[0-9A-F][0-9A-F]:[0-9A-F][0-9A-F]:[0-9A-F][0-9A-F])
+            printf '%s\n' "$raw"
+            ;;
+        [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F])
+            printf '%s\n' "$raw" | sed 's/../&:/g; s/:$//'
+            ;;
+        *)
+            printf '\n'
+            ;;
+    esac
+}
+
+pen_name_matches() {
+    name=$(printf '%s' "$1" | tr -d '\r"' | tr 'A-Z' 'a-z')
+    case "$name" in
+        *pen*|*stylus*|*pencil*|*lenovo*|*xiaoxin*|*yoga*|*picasso*) return 0 ;;
+    esac
+    # 目标笔型关键字（AP501U / AP500U / Tab Pen Plus / picasso）。上面的宽松
+    # 规则已经覆盖绝大多数联想笔名，这里只是把本构建明确支持的型号再钉一遍，
+    # 避免出现"名字里没有 pen/stylus"的固件写法时漏认。
+    for keyword in $PEN_MODEL_KEYWORDS; do
+        case "$name" in
+            *"$keyword"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+same_pen_mac() {
+    left=$(normalize_pen_mac "$1")
+    right=$(normalize_pen_mac "$2")
+    [ -n "$left" ] && [ "$left" = "$right" ]
+}
+
+# Prefer the configured address when it is still a bonded pen. If it is stale,
+# select a bonded pen by its advertised name and persist the new address. This
+# keeps the Bluetooth path independent of any factory MAC without attempting
+# unrelated bonded devices.
+find_bonded_pen_mac() {
+    preferred=$(normalize_pen_mac "$1")
+    for config in \
+            /data/misc/bluedroid/bt_config.conf \
+            /data/misc/bluetooth/bt_config.conf \
+            /data/misc/bluetooth/bt_config.conf.old; do
+        [ -r "$config" ] || continue
+        best=""
+        block_mac=""
+        block_name=""
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                \[*\])
+                    block_key=${line#\[}
+                    block_key=${block_key%\]}
+                    candidate=$(normalize_pen_mac "$block_key")
+                    if [ -n "$block_mac" ] && pen_name_matches "$block_name"; then
+                        if same_pen_mac "$block_mac" "$preferred"; then
+                            printf '%s\n' "$block_mac"
+                            return 0
+                        fi
+                        [ -n "$best" ] || best="$block_mac"
+                    fi
+                    block_mac="$candidate"
+                    block_name=""
+                    ;;
+                Name=*)
+                    block_name=${line#Name=}
+                    ;;
+            esac
+        done <"$config"
+        if [ -n "$block_mac" ] && pen_name_matches "$block_name"; then
+            if same_pen_mac "$block_mac" "$preferred"; then
+                printf '%s\n' "$block_mac"
+                return 0
+            fi
+            [ -n "$best" ] || best="$block_mac"
+        fi
+        if [ -n "$best" ]; then
+            printf '%s\n' "$best"
+            return 0
+        fi
+    done
+    printf '\n'
+}
+
+resolve_pen_mac() {
+    configured=$(normalize_pen_mac "$(settings get global ipe_pencil_mac_addr 2>/dev/null)")
+    resolved=$(find_bonded_pen_mac "$configured")
+    if ! is_pen_mac "$resolved"; then
+        resolved="$configured"
+    fi
+    if is_pen_mac "$resolved" && ! same_pen_mac "$resolved" "$configured"; then
+        settings put global ipe_pencil_mac_addr "$resolved" >/dev/null 2>&1
+        echo "[$(date '+%F %T')] selected bonded pen address=$resolved previous=$configured" >&2
+    fi
+    printf '%s\n' "$resolved"
+}
+
+pen_mac_compact() {
+    mac=$(resolve_pen_mac)
+    printf '%s\n' "$mac" | tr -d ':'
+}
+
+request_pen_capsule() {
+    [ "$(read_hall_state)" = 1 ] || return 0
+    connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+    if [ "$connected" != 1 ]; then
+        echo "[$(date '+%F %T')] magnetic capsule delayed: BLE link not ready"
+        return 1
+    fi
+    battery_valid=$(settings get global lenovo_pen_hardware_battery_valid 2>/dev/null | tr -d '\r')
+    if [ "$battery_valid" != 1 ]; then
+        echo "[$(date '+%F %T')] magnetic capsule delayed: fresh battery sample unavailable"
+        return 1
+    fi
+    battery=$(settings get global ipe_pencil_battery_level 2>/dev/null | tr -d '\r')
+    if ! valid_level "$battery"; then
+        echo "[$(date '+%F %T')] magnetic capsule delayed: invalid battery sample=$battery"
+        return 1
+    fi
+    now=$(date '+%s' 2>/dev/null)
+    previous=$(cat "$CAPSULE_DEDUP_FILE" 2>/dev/null)
+    previous_time=${previous%%:*}
+    previous_state=${previous#*:}
+    case "$now:$previous_time" in
+        *[!0-9:]*|:*) ;;
+        *)
+            if [ "$previous_state" = 1 ] && [ "$now" -ge "$previous_time" ] \
+                    && [ "$((now - previous_time))" -lt "$CAPSULE_DEDUP_SECONDS" ]; then
+                echo "[$(date '+%F %T')] duplicate magnetic capsule suppressed"
+                return 0
+            fi
+            ;;
+    esac
+    charging=$(read_hardware_charging 1)
+    mac=$(pen_mac_compact)
+    am broadcast --user 0 --receiver-foreground \
+        -a com.aclaniakea.lenovopenbridge.action.SHOW_PENCIL_CAPSULE \
+        -p com.oplus.ipemanager \
+        --ei battery_level "$battery" \
+        --ei charging_state "$charging" \
+        --ei charging "$charging" \
+        --es present 1 \
+        --es macAddr "$mac" \
+        --es source hardware_hall_root >/dev/null 2>&1
+    echo "$now:1" >"$CAPSULE_DEDUP_FILE"
+    echo "[$(date '+%F %T')] real Hall magnetic capsule requested battery=$battery charging=$charging mac=$mac"
+}
+
+request_pen_capsule_when_ready() {
+    attempts=0
+    while [ "$attempts" -lt 40 ] && [ "$(read_hall_state)" = 1 ]; do
+        request_pen_capsule && return 0
+        attempts=$((attempts + 1))
+        sleep_sec 0.5
+    done
+    echo "[$(date '+%F %T')] magnetic capsule abandoned: link/battery not ready after ${attempts} attempts"
+}
+
+publish_hall_state() {
+    docked="$1"
+    battery=$(read_hardware_battery)
+    charging=$(read_hardware_charging "$docked")
+    mac=$(pen_mac_compact)
+    connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+    [ "$connected" = 1 ] || connected=0
+
+    settings put global lenovo_pen_physical_docked "$docked" >/dev/null 2>&1
+    settings put global ipe_pencil_charging_state "$charging" >/dev/null 2>&1
+    if valid_level "$battery"; then
+        # This is a cache update only after a real sample.  An unavailable
+        # CPS/GATT sample must not overwrite the last known level with -1.
+        settings put global ipe_pencil_battery_level "$battery" >/dev/null 2>&1
+    fi
+    refresh_active=0
+    if [ "$docked" != 1 ] && [ "$connected" = 1 ]; then
+        refresh_active=1
+    fi
+    # The refresh-rate policy is valid only while writing, but Device Space
+    # treats the next two keys as the existence of a connected pen. Do not
+    # hide a real Bluetooth device merely because it is magnetically docked.
+    settings put global lenovo_pen_refresh_active "$refresh_active" >/dev/null 2>&1
+    # OPlusRefreshRatePolicyImpl reads settings_enable_oppo_pencil as
+    # isIPEPencilConnected and votes ipePencilRateId (120 Hz) while it is 1.
+    # A docked pen is not being written with, so report "pen in use" only
+    # when the pen is both connected and off the magnetic dock.
+    settings put global settings_enable_oppo_pencil "$refresh_active" >/dev/null 2>&1
+    settings put global ipe_pencil_present "$connected" >/dev/null 2>&1
+
+    battery_args=""
+    battery_trusted=$(settings get global lenovo_pen_hardware_battery_valid 2>/dev/null | tr -d '\r')
+    if valid_level "$battery" && [ "$battery_trusted" = 1 ]; then
+        battery_args="--ei battery_level $battery --ei batteryLevel $battery"
+        hardware_battery=true
+    else
+        hardware_battery=false
+    fi
+    am broadcast --user 0 --receiver-foreground \
+        -a com.aclaniakea.lenovopenbridge.action.COLOROS_PEN_STATE \
+        -p com.oplus.ipemanager \
+        $battery_args \
+        --ei charging_state "$charging" \
+        --ei chargingState "$charging" \
+        --ei charging "$charging" \
+        --ei physicalDocked "$docked" \
+        --es macAddr "$mac" \
+        --es name "$PEN_MODEL_NAME" \
+        --es source hardware_hall \
+        --ez hardware_battery "$hardware_battery" \
+        --ez hardware_identity_known true >/dev/null 2>&1
+    echo "[$(date '+%F %T')] real Hall state docked=$docked battery=$battery trusted=$hardware_battery charging=$charging connected=$connected mac=$mac"
+}
+
+monitor_battery_cache() {
+    while [ ! -e "$CPS_DISABLED" ]; do
+        # Before the real HOGP link exists, IPeManager deliberately owns an
+        # unknown battery state. Re-injecting a cached level every 10 seconds
+        # makes it clear that state again, then restarts the same UI/BT work.
+        # Hall-edge publication already preserves the last known value for
+        # the capsule; continuous repair begins only after a real link.
+        connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+        if [ "$connected" != 1 ]; then
+            sleep_sec 10
+            continue
+        fi
+        before=$(settings get global ipe_pencil_battery_level 2>/dev/null | tr -d '\r')
+        level=$(read_hardware_battery)
+        # The OEM process can publish an unknown sample after the Root boot
+        # snapshot. Repair only that cache transition, then let the normal
+        # settings receiver consume one valid battery notification.
+        if valid_level "$level" && [ "$before" != "$level" ]; then
+            docked=$(read_hall_state)
+            case "$docked" in
+                0|1)
+                    publish_hall_state "$docked"
+                    echo "[$(date '+%F %T')] invalid battery cache repaired level=$level"
+                    ;;
+            esac
+        fi
+        sleep_sec 10
+    done
+}
+
+monitor_charging_cache() {
+    last=$(settings get global lenovo_pen_hardware_charge_state 2>/dev/null | tr -d '\r')
+    case "$last" in 0|1) ;; *) last=-1 ;; esac
+    while [ ! -e "$CPS_DISABLED" ]; do
+        # As with battery repair, avoid fighting IPeManager's disconnected
+        # state machine. A Hall edge still publishes the physical dock/charge
+        # snapshot once; periodic correction is for an established BLE link.
+        connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+        if [ "$connected" != 1 ]; then
+            sleep_sec 10
+            continue
+        fi
+        docked=$(read_hall_state)
+        case "$docked" in
+            0|1)
+                charging=$(read_hardware_charging "$docked")
+                case "$charging" in
+                    0|1)
+                        mirrored=$(settings get global ipe_pencil_charging_state 2>/dev/null | tr -d '\r')
+                        # OEM state replay can overwrite the UI mirror after
+                        # the hardware value has already settled. Repair a
+                        # mirror mismatch even when the physical state itself
+                        # did not change (notably 100%/Full -> charging=0).
+                        if [ "$charging" != "$last" ] || [ "$mirrored" != "$charging" ]; then
+                            last="$charging"
+                            publish_hall_state "$docked"
+                            echo "[$(date '+%F %T')] charging state repaired charging=$charging mirrored=$mirrored docked=$docked"
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+        sleep_sec 10
+    done
+}
+
+# Two-way sync (system Bluetooth -> Device Space). dumpsys masks the first
+# four MAC octets, so match the visible last two octets of the pen address
+# against the HOGP (LE HID) profile state; HOGP state 2 is a live link.
+real_bt_connected() {
+    mac=$(resolve_pen_mac)
+    is_pen_mac "$mac" || return 1
+    tail=${mac#*:*:*:*:}
+    case "$tail" in
+        *[!0-9A-Fa-f:]*|'') return 1 ;;
+    esac
+    tail=$(printf '%s' "$tail" | tr 'A-Z' 'a-z')
+    # Match one current profile-summary line only. The bluetooth dump also
+    # contains connection history; matching the MAC and state independently
+    # across the whole dump made a disconnected pen look connected whenever
+    # an old "HOGP connection state=2" record was still present.
+    dumpsys bluetooth_manager 2>/dev/null \
+        | tr 'A-Z' 'a-z' \
+        | grep -E "$tail .*hogp connection state=2" >/dev/null 2>&1
+}
+
+# 笔在用时的 120Hz 由原厂 OplusRefreshRatePolicyImpl 依据
+# settings_enable_oppo_pencil 自行投票；本模块不读取或写入用户的
+# system min_refresh_rate / peak_refresh_rate。
+
+# The OEM mirrors can lag or be overridden by a stale disconnect latch. Poll
+# the actual Bluetooth stack at low rate and republish the connection
+# mirrors so Device Space always follows the real link. If a live link appears
+# while a stale user-disconnect latch is still set, the stack has already
+# reconnected: clear the latch so the UI stops reporting "disconnected".
+# 用户在设置页或设备空间点「断开连接」/「立即连接」之后，真实 ACL 链路需要
+# 一到三秒才跟上。Hook 会同时写下意图目标与时间戳；在收敛窗口内对账器既不
+# 改写连接镜像，也不清 user latch。否则它会把用户半秒前刚表达的意图当成
+# 「陈旧闩锁」清掉，自动重连随即把 UI 翻回已连接，表现为反复横跳。
+PEN_USER_ACTION_GRACE=8
+
+in_user_action_window() {
+    real_state="$1"
+    ts=$(settings get global lenovo_pen_user_action_ts 2>/dev/null | tr -d '\r')
+    target=$(settings get global lenovo_pen_user_action_target 2>/dev/null | tr -d '\r')
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+    case "$target" in 0|1) ;; *) return 1 ;; esac
+    # 真实链路已经追上用户意图：立即退出窗口，恢复正常对账。
+    [ "$real_state" = "$target" ] && return 1
+    now=$(date '+%s' 2>/dev/null)
+    case "$now" in ''|*[!0-9]*) return 1 ;; esac
+    # 时钟回拨时按窗口外处理，避免窗口被拉长到不确定的时间。
+    [ "$now" -lt "$ts" ] && return 1
+    [ "$((now - ts))" -lt "$PEN_USER_ACTION_GRACE" ]
+}
+
+monitor_real_bt_state() {
+    last=-1
+    last_oem_recovery=0
+    oem_recovery_attempts=0
+    oem_recovery_exhausted=0
+    while [ ! -e "$CPS_DISABLED" ]; do
+        if real_bt_connected; then
+            connected=1
+        else
+            connected=0
+        fi
+        # 用户刚操作过且链路尚未收敛：本轮完全不发布，只快速重采样。
+        # 这是有界的（PEN_USER_ACTION_GRACE 秒），收敛后立即回到 30 秒低频对账，
+        # 不会变成常驻 1Hz 轮询。
+        if in_user_action_window "$connected"; then
+            sleep_sec 1
+            continue
+        fi
+        current=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+        [ "$current" = 1 ] || current=0
+        if [ "$connected" != "$current" ] || [ "$connected" != "$last" ]; then
+            settings put global lenovo_pen_link_connected "$connected" >/dev/null 2>&1
+            # OPlusRefreshRateService treats ipe_pencil_connect_state==1 as the
+            # IPE pencil connected (isIPEPencilConnected) and votes the OEM
+            # ipePencilRateId (120 Hz) while connected. The other mirror keys
+            # keep the legacy connected encoding for the pen settings UI.
+            connect_state=0
+            [ "$connected" = 1 ] && connect_state=2
+            for key in ipe_pencil_connection_state PENCIL_CONNECT_STATE pencil_connect_state; do
+                settings put global "$key" "$connect_state" >/dev/null 2>&1
+            done
+            settings put global ipe_pencil_connect_state "$connected" >/dev/null 2>&1
+            docked=$(settings get global lenovo_pen_physical_docked 2>/dev/null | tr -d '\r')
+            [ "$docked" = 1 ] || docked=0
+            pen_in_use=0
+            [ "$connected" = 1 ] && [ "$docked" != 1 ] && pen_in_use=1
+            settings put global settings_enable_oppo_pencil "$pen_in_use" >/dev/null 2>&1
+            settings put global ipe_pencil_present "$connected" >/dev/null 2>&1
+            if [ "$connected" = 1 ]; then
+                user_requested=$(settings get global lenovo_pen_user_disconnect_requested 2>/dev/null | tr -d '\r')
+                if [ "$user_requested" = 1 ]; then
+                    settings put global lenovo_pen_user_disconnect_requested 0 >/dev/null 2>&1
+                    settings put global lenovo_pen_disconnect_requested 0 >/dev/null 2>&1
+                    echo "[$(date '+%F %T')] real BT link present; cleared stale disconnect latch"
+                fi
+            fi
+            # Push the real link to the OEM UI: the Hook's handoff receiver
+            # consumes the connected extra and forwards it to the panel and
+            # settings callbacks, so a sheet opened before the link came up
+            # stops showing a stale "connecting/disconnected" state.
+            battery=$(settings get global ipe_pencil_battery_level 2>/dev/null | tr -d '\r')
+            valid_level "$battery" || battery=$(settings get global lenovo_pen_last_valid_battery 2>/dev/null | tr -d '\r')
+            charging=$(settings get global lenovo_pen_hardware_charge_state 2>/dev/null | tr -d '\r')
+            case "$charging" in 0|1) ;; *) charging=0 ;; esac
+            mac=$(pen_mac_compact)
+            am broadcast --user 0 --receiver-foreground \
+                -a com.aclaniakea.lenovopenbridge.action.COLOROS_PEN_STATE \
+                -p com.oplus.ipemanager \
+                --ei connected "$connected" \
+                --ei battery_level "$battery" \
+                --ei charging_state "$charging" \
+                --es present "$connected" \
+                --es macAddr "$mac" \
+                --es source hardware_hall >/dev/null 2>&1
+            echo "[$(date '+%F %T')] real BT state mirror connected=$connected (was $current)"
+            # A new physical ACL/HOGP session is the only sound reason to
+            # retry OEM GATT-session recovery.  Do not carry a failed budget
+            # across a genuine disconnect/reconnect edge.
+            oem_recovery_attempts=0
+            oem_recovery_exhausted=0
+            last_oem_recovery=0
+            last="$connected"
+        fi
+        if [ "$connected" = 1 ] \
+                && [ "$(settings get global lenovo_pen_oem_control_ready 2>/dev/null | tr -d '\r')" != 1 ] \
+                && [ "$(settings get global lenovo_pen_disconnect_requested 2>/dev/null | tr -d '\r')" != 1 ]; then
+            now=$(date '+%s' 2>/dev/null)
+            case "$now:$last_oem_recovery" in
+                *[!0-9:]*|:*) ;;
+                *)
+                    if [ "$oem_recovery_attempts" -lt 3 ] \
+                            && [ "$now" -ge "$last_oem_recovery" ] \
+                            && [ "$((now - last_oem_recovery))" -ge 30 ]; then
+                        last_oem_recovery="$now"
+                        oem_recovery_attempts=$((oem_recovery_attempts + 1))
+                        request_oem_pen_action "$OEM_CONNECT_ACTION"
+                        echo "[$(date '+%F %T')] live HOGP missing OEM haptic session; recovery requested attempt=$oem_recovery_attempts/3"
+                    elif [ "$oem_recovery_attempts" -ge 3 ] && [ "$oem_recovery_exhausted" = 0 ]; then
+                        # The OEM receiver rejected a live link repeatedly.
+                        # Retrying forever turns a missing optional session
+                        # into a 30-second Bluetooth/system_server CPU spike.
+                        # The direct GATT haptic path remains available; try
+                        # OEM recovery again only after a real link edge.
+                        oem_recovery_exhausted=1
+                        echo "[$(date '+%F %T')] OEM haptic recovery deferred until next real BT link edge"
+                    fi
+                    ;;
+            esac
+        fi
+        # Real ACL/GATT callbacks update the mirror immediately.  Keep this
+        # expensive full bluetooth_manager dump as a low-rate reconciliation
+        # path only, not a one-Hz permanent poll.
+        trim_log_if_large
+        sleep_sec 30
+    done
+}
+
+monitor_hall_capsule() {
+    candidate=-1
+    samples=0
+    boot_cycle=1
+    last=$(cat "$HALL_STATE_FILE" 2>/dev/null | tr -d '\r')
+    case "$last" in 0|1) ;; *) last=-1 ;; esac
+    while [ ! -e "$CPS_DISABLED" ]; do
+        state=$(read_hall_state)
+        case "$state" in
+            0|1)
+                if [ "$state" = "$candidate" ]; then
+                    samples=$((samples + 1))
+                else
+                    candidate="$state"
+                    samples=1
+                fi
+                if [ "$samples" -ge 2 ]; then
+                    # Do not republish solely because a receiver has not yet
+                    # mirrored the setting. That feedback loop generated
+                    # repeated system_server broadcasts every poll interval.
+                    if [ "$boot_cycle" = 1 ] || [ "$state" != "$last" ]; then
+                        previous="$last"
+                        last="$state"
+                        echo "$state" >"$HALL_STATE_FILE"
+                        if [ "$state" = 1 ] && [ "$previous" != 1 ]; then
+                            # A dock edge starts a new pen power session. Do
+                            # not let the previous session's cached battery
+                            # satisfy this attach's capsule readiness check.
+                            settings put global lenovo_pen_hardware_battery_valid 0 >/dev/null 2>&1
+                        fi
+                        publish_hall_state "$state"
+                        if [ "$state" = 1 ]; then
+                            # Magnetic attach is a physical reconnect intent:
+                            # clear any stale disconnect latch and restore the
+                            # link if it is not already up at the BT layer.
+                            settings put global lenovo_pen_user_disconnect_requested 0 >/dev/null 2>&1
+                            settings put global lenovo_pen_disconnect_requested 0 >/dev/null 2>&1
+                            if ! real_bt_connected; then
+                                request_pen_connect
+                            fi
+                            if [ "$boot_cycle" = 1 ]; then
+                                # IPeManager's BLE process registers the
+                                # dynamic Capsule receiver late in boot. Do
+                                # not spend the only boot request before it
+                                # exists; the real Hall state is already
+                                # published above.
+                                (
+                                    sleep_sec 22
+                                    request_pen_capsule_when_ready
+                                ) &
+                            else
+                                request_pen_capsule_when_ready &
+                            fi
+                        fi
+                        boot_cycle=0
+                    fi
+                fi
+                ;;
+        esac
+        sleep_sec 1
+    done
+}
+
+run_hidctl() {
+    action="$1"
+    mac=$(resolve_pen_mac)
+    if ! is_pen_mac "$mac"; then
+        echo "[$(date '+%F %T')] HID $action skipped: no bonded pen MAC"
+        return 0
+    fi
+    if [ -z "$(pm path com.aclaniakea.penhidctl 2>/dev/null)" ]; then
+        echo "[$(date '+%F %T')] HID $action skipped: helper APK unavailable"
+        return 0
+    fi
+    grant_hidctl_bluetooth_permissions
+    if am start-foreground-service --user 0 -n "$HIDCTL_SERVICE" \
+            --es action "$action" --es mac "$mac" >/dev/null 2>&1; then
+        echo "[$(date '+%F %T')] HID $action service requested mac=$mac"
+    else
+        echo "[$(date '+%F %T')] HID $action request failed mac=$mac"
+    fi
+}
+
+request_oem_pen_action() {
+    action="$1"
+    mac=$(resolve_pen_mac)
+    if ! is_pen_mac "$mac"; then
+        echo "[$(date '+%F %T')] OEM $action skipped: no bonded pen MAC"
+        return 0
+    fi
+    if [ -z "$(pm path com.oplus.ipemanager 2>/dev/null)" ]; then
+        echo "[$(date '+%F %T')] OEM $action skipped: IPeManager unavailable"
+        return 0
+    fi
+    # These are the vendor service's real actions.  CONNECT_PENCIL reaches
+    # s0.x()/BleManager.b(), while DISCONNECT_PENCIL reaches s0.z() and the
+    # hidden BluetoothDevice.disconnect() path.  The old Root service only
+    # sent a custom system_server broadcast, which could not close/open the
+    # OEM GATT link.
+    extra=""
+    if [ "$action" = "$OEM_CONNECT_ACTION" ]; then
+        extra="--ez codex_auto_connect true"
+    fi
+    if am startservice --user 0 -n "$OEM_CORE_SERVICE" \
+            -a "$action" --es device_mac_info "$mac" $extra >/dev/null 2>&1; then
+
+        echo "[$(date '+%F %T')] OEM $action requested mac=$mac"
+    else
+        echo "[$(date '+%F %T')] OEM $action request failed mac=$mac"
+    fi
+}
+
+request_pen_connect() {
+    requested=$(settings get global lenovo_pen_disconnect_requested 2>/dev/null | tr -d '\r')
+    [ "$requested" = 1 ] && {
+        echo "[$(date '+%F %T')] pen connect skipped: Settings disconnect latch is set"
+        return 0
+    }
+    user_requested=$(settings get global lenovo_pen_user_disconnect_requested 2>/dev/null | tr -d '\r')
+    [ "$user_requested" = 1 ] && {
+        echo "[$(date '+%F %T')] pen connect skipped: user disconnect choice is active"
+        return 0
+    }
+
+    now=$(date '+%s' 2>/dev/null)
+    previous=$(cat "$PEN_CONNECT_DEDUP_FILE" 2>/dev/null)
+    case "$previous" in
+        ''|*[!0-9]*) ;;
+        *)
+            [ "$now" -ge "$previous" ] && [ "$((now - previous))" -lt 8 ] && return 0
+            ;;
+    esac
+    echo "$now" >"$PEN_CONNECT_DEDUP_FILE"
+    request_oem_pen_action "$OEM_CONNECT_ACTION"
+    # Let the stock CoreService create the BLE/GATT session before asking the
+    # hidden HID Host profile to attach to the same bonded device. The panel
+    # is forced to the real link state by the Hook, so this wait only needs
+    # to cover the OEM GATT session, not the full UI round-trip.
+    sleep_sec 1
+    run_hidctl connect
+}
+
+# The Settings reconnect button must remain a bounded user action, but a
+# single HID request can race the OEM GATT service while the pen is waking.
+# Retry HID Host only (the original CoreService session stays authoritative)
+# and stop immediately when the current HOGP summary reports state 2.
+request_pen_connect_bounded() {
+    request_pen_connect
+    (
+        retry=1
+        while [ "$retry" -le 3 ] && [ ! -e "$CPS_DISABLED" ]; do
+            sleep_sec 3
+            if real_bt_connected; then
+                echo "[$(date '+%F %T')] explicit pen reconnect confirmed by HOGP attempt=$retry"
+                exit 0
+            fi
+            run_hidctl connect
+            echo "[$(date '+%F %T')] explicit pen HID retry attempt=$retry"
+            retry=$((retry + 1))
+        done
+        echo "[$(date '+%F %T')] explicit pen reconnect window ended without HOGP"
+    ) &
+}
+
+request_pen_disconnect() {
+    request_oem_pen_action "$OEM_DISCONNECT_ACTION"
+    run_hidctl disconnect
+}
+
+# The stock settings action updates the IPe state, but on this port HID Host
+# remains connected. Enforce an explicit settings-page Disconnect at both the
+# vendor CoreService and the actual HID profile. A 1 -> 0 transition is the
+# only runtime path that requests a connect; an idle 0 with no live link is
+# left alone because the bounded boot loop is the only automatic recovery.
+monitor_hid_latch() {
+    last=$(settings get global lenovo_pen_disconnect_requested 2>/dev/null | tr -d '\r')
+    case "$last" in
+        1|0) ;;
+        *) last=-1 ;;
+    esac
+    repeat=0
+    while [ ! -e "$CPS_DISABLED" ]; do
+        requested=$(settings get global lenovo_pen_disconnect_requested 2>/dev/null | tr -d '\r')
+        case "$requested" in
+            1)
+                if [ "$last" != 1 ]; then
+                    request_pen_disconnect
+                    repeat=0
+                else
+                    repeat=0
+                fi
+                ;;
+            0)
+                if [ "$last" = 1 ]; then
+                    user_requested=$(settings get global lenovo_pen_user_disconnect_requested 2>/dev/null | tr -d '\r')
+                    if [ "$user_requested" = 1 ]; then
+                        echo "[$(date '+%F %T')] explicit pen connect skipped: user disconnect choice is active"
+                    elif real_bt_connected; then
+                        echo "[$(date '+%F %T')] explicit pen connect already has a real link"
+                    else
+                        request_pen_connect_bounded
+                    fi
+                    repeat=0
+                else
+                    repeat=0
+                fi
+
+                ;;
+            *)
+                repeat=0
+                ;;
+        esac
+        last="$requested"
+        sleep_sec 5
+    done
+}
+
+# Boot-time monitors start here: after every helper they call (run_hidctl,
+# request_oem_pen_action, request_pen_connect, request_pen_disconnect) has
+# already been parsed above, so the forked subshells inherit the full symbol
+# table and the first magnetic edge cannot hit "request_pen_connect: not
+# found". They still start before the boot-connect retry window, preserving
+# the original boot-time state publication (connection mirrors + haptics).
+monitor_hall_capsule &
+monitor_battery_cache &
+monitor_charging_cache &
+monitor_real_bt_state &
+
+monitor_hid_latch &
+
+# The ported IPeManager package carries the vendor Bluetooth receivers in
+# its resolver table, but their user-0 component state is disabled.  Enable
+# only those two stock receivers so the real OAF/ACL events can start
+# CoreService under Oppo's own UID; no synthetic event or connection state is
+# written here.
+for receiver in \
+    com.oplus.ipemanager/.btadsorb.ble.BluetoothStatusReceiver \
+    com.oplus.ipemanager/.btadsorb.receiver.BluetoothBroadcastReceiver; do
+    if pm enable --user 0 "$receiver" >/dev/null 2>&1; then
+        echo "[$(date '+%F %T')] enabled Oppo pen receiver=$receiver"
+    else
+        echo "[$(date '+%F %T')] unable to enable Oppo pen receiver=$receiver"
+    fi
+done
+
+# On this port the CPS8601 is probed before hall_detect has replayed the
+# initial docked state. The vendor hall notifier's real event 1 sequence is
+# therefore never emitted at boot: cps_power_gpio (13) is high, but the
+# controller's sw_en (10) and boost_mode (108) pins remain low. The second
+# Hall node alone is high both when docked and when detached, so gate the
+# real GPIO keeper on the validated Hall pair (0:1 == docked). No pen,
+# Bluetooth or attention state is synthesized here; the CPS driver must still
+# report the actual chip, battery and HID state.
+start_cps_gpio() {
+    [ -r "$CPS_PEN_HALL" ] || return 0
+    [ "$(read_hall_state)" = 1 ] || return 0
+    [ -x "$CPS_HELPER" ] || [ -x "$CPS_GPIOSET" ] || {
+        echo "[$(date '+%F %T')] CPS GPIO helper unavailable; wake skipped"
+        return 0
+    }
+    [ -e "$CPS_GPIODEV" ] || return 0
+
+    if [ -r "$CPS_PIDFILE" ]; then
+        old_pid=$(cat "$CPS_PIDFILE" 2>/dev/null)
+        case "$old_pid" in
+            ''|*[!0-9]*) old_pid= ;;
+            *) kill -0 "$old_pid" 2>/dev/null && return 0 ;;
+        esac
+    fi
+    rm -f "$CPS_PIDFILE"
+
+    if [ -x "$CPS_HELPER" ]; then
+        "$CPS_HELPER" >/dev/null 2>&1 &
+        cps_pid=$!
+        sleep_sec 1
+        if kill -0 "$cps_pid" 2>/dev/null; then
+            echo "$cps_pid" >"$CPS_PIDFILE"
+            echo "[$(date '+%F %T')] CPS GPIO handle holder started pid=$cps_pid hall=1 gpio=10,108"
+            return 0
+        fi
+        echo "[$(date '+%F %T')] CPS GPIO handle helper exited; using gpioset fallback"
+    fi
+
+    (
+        cleanup_cps_gpio() {
+            "$CPS_GPIOSET" "$CPS_GPIOCHIP" 10=0 108=0 >/dev/null 2>&1
+            exit 0
+        }
+        trap cleanup_cps_gpio HUP INT TERM
+        while [ ! -e "$CPS_DISABLED" ] && [ -r "$CPS_PEN_HALL" ] \
+                && [ "$(read_hall_state)" = 1 ]; do
+            "$CPS_GPIOSET" "$CPS_GPIOCHIP" 10=1 108=1 >/dev/null 2>&1
+            # gpioset is a fallback for kernels where the line-holder helper
+            # exits. The CPS state is latched; refreshing at 5 s avoids a
+            # needless one-Hz process/exec loop while the pen is docked.
+            sleep_sec 5
+        done
+        cleanup_cps_gpio
+    ) &
+    cps_pid=$!
+    echo "$cps_pid" >"$CPS_PIDFILE"
+    echo "[$(date '+%F %T')] CPS real wake sequence started pid=$cps_pid hall=1 gpio=10,108"
+}
+
+stop_cps_gpio() {
+    had_pid=0
+    if [ -r "$CPS_PIDFILE" ]; then
+        cps_pid=$(cat "$CPS_PIDFILE" 2>/dev/null)
+        case "$cps_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                had_pid=1
+                kill "$cps_pid" 2>/dev/null
+                ;;
+        esac
+        rm -f "$CPS_PIDFILE"
+    fi
+    [ "$had_pid" = 1 ] && "$CPS_GPIOSET" "$CPS_GPIOCHIP" 10=0 108=0 >/dev/null 2>&1
+}
+
+monitor_cps_gpio() {
+    wait_count=0
+    while [ ! -r "$CPS_PEN_HALL" ] && [ "$wait_count" -lt 120 ]; do
+        sleep_sec 1
+        wait_count=$((wait_count + 1))
+    done
+    while [ ! -e "$CPS_DISABLED" ]; do
+        if [ -r "$CPS_PEN_HALL" ] && [ "$(read_hall_state)" = 1 ]; then
+            start_cps_gpio
+        else
+            stop_cps_gpio
+        fi
+        sleep_sec 2
+    done
+    stop_cps_gpio
+}
+
+wait_for_cps_power() {
+    wait_count=0
+    while [ ! -e "$CPS_DISABLED" ] && [ "$wait_count" -lt 20 ]; do
+        if [ "$(read_hall_state)" = 0 ]; then
+            echo "[$(date '+%F %T')] CPS boot power skipped: pen is not magnetically docked"
+            return 1
+        fi
+        if [ -r "$CPS_PEN_HALL" ] && [ "$(read_hall_state)" = 1 ]; then
+            start_cps_gpio
+            cps_pid=$(cat "$CPS_PIDFILE" 2>/dev/null)
+            case "$cps_pid" in
+                ''|*[!0-9]*) ;;
+                *)
+                    if kill -0 "$cps_pid" 2>/dev/null; then
+                        echo "[$(date '+%F %T')] CPS boot power ready pid=$cps_pid"
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+        sleep_sec 1
+        wait_count=$((wait_count + 1))
+    done
+    echo "[$(date '+%F %T')] CPS boot power wait ended without a live GPIO holder"
+    return 1
+}
+
+monitor_cps_gpio &
+echo "[$(date '+%F %T')] CPS hall monitor started path=$CPS_PEN_HALL"
+
+# CPS power is a charging concern only. Bluetooth pen recovery must not wait
+# for Hall/CPS because the OEM pen protocol is wireless even while undocked.
+if [ "$(read_hall_state)" = 1 ] && wait_for_cps_power; then
+    echo "[$(date '+%F %T')] CPS boot power ready before Bluetooth retries"
+fi
+touch "$PEN_BOOT_READY_FILE"
+
+# Re-emit the driver's current INFO/MAC/TOUCH_INFORMATION snapshot after the
+# LSPosed system_server observer has started.
+if [ -w "$UEVENT" ]; then
+    echo change >"$UEVENT"
+    echo "[$(date '+%F %T')] PEN_FRAMEWORK uevent requested"
+fi
+if [ -w "$CPS_UEVENT" ]; then
+    echo change >"$CPS_UEVENT"
+    echo "[$(date '+%F %T')] CPS uevent requested"
+fi
+
+# Keep the real vendor request alive across Bluetooth's late service startup
+# window.  Stop as soon as the ACL/GATT callback has reported a live link; do
+# not send the old RECONNECT_PEN broadcast, which clears the settings latch and
+# invokes a synthetic system_server replay before the real link exists.
+# The Lenovo pen powers itself off when it is not magnetically docked, so
+# actively searching for it over Bluetooth is pointless (and the early pokes
+# used to restart the adapter). Only connect after the CPS power-on, which can
+# only wake a docked pen; the dock-attach edge reconnects it later.
+# Do not poke the Bluetooth stack while it is still coming up.
+bt_wait=0
+while [ "$bt_wait" -lt 60 ]; do
+    [ "$(settings get global bluetooth_on 2>/dev/null | tr -d '\r')" = 1 ] && break
+    sleep_sec 2
+    bt_wait=$((bt_wait + 2))
+done
+requested=$(settings get global lenovo_pen_disconnect_requested 2>/dev/null | tr -d '\r')
+user_requested=$(settings get global lenovo_pen_user_disconnect_requested 2>/dev/null | tr -d '\r')
+connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+if [ "$connected" = 1 ]; then
+    echo "[$(date '+%F %T')] boot pen connect confirmed by real ACL/GATT state"
+elif [ "$requested" = 1 ] || [ "$user_requested" = 1 ]; then
+    echo "[$(date '+%F %T')] boot pen connect skipped: Settings disconnect latch is set"
+elif [ "$(read_hall_state)" = 1 ]; then
+    # Docked: the CPS boot power sequence already ran; connect once and give
+    # the link a bounded window to come up.
+    request_pen_connect
+    echo "[$(date '+%F %T')] real OEM boot connect requested (docked/CPS powered)"
+    attempt=2
+    while [ "$attempt" -le 4 ] && [ ! -e "$CPS_DISABLED" ]; do
+        sleep_sec 12
+        connected=$(settings get global lenovo_pen_link_connected 2>/dev/null | tr -d '\r')
+        if [ "$connected" = 1 ]; then
+            echo "[$(date '+%F %T')] boot pen connect confirmed by real ACL/GATT state"
+            break
+        fi
+        request_pen_connect
+        echo "[$(date '+%F %T')] real OEM boot connect retry attempt=$attempt"
+        attempt=$((attempt + 1))
+    done
+else
+    echo "[$(date '+%F %T')] pen not docked; boot connect skipped (CPS can only wake a docked pen)"
+fi
+
+# Keep all monitor children alive after the boot retry window. Exiting the
+# shell here can orphan/kill the CPS, Hall and HID reconciliation loops on
+# some KernelSU/Magisk launchers, which leaves only the already-open BLE link.
+while [ ! -e "$CPS_DISABLED" ]; do
+    sleep_sec 30
+done

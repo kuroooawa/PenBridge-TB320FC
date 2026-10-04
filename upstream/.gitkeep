@@ -1,0 +1,8 @@
+上游未打补丁的产物放这里（本目录内容不入库）：
+  upstream/PenBridge-Module-v4.1.3.zip   上游 KernelSU 模块 zip
+  upstream/PenBridge-Hook.apk            上游 Hook APK（从上游模块的 hook/ 目录取出）
+
+可选：把上游 zip 解到 upstream/module-upstream/ 之后，可用
+  python tools/diff_module.py
+  python tools/shell_balance.py
+与上游逐文件对比。
