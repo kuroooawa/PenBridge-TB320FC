@@ -10,7 +10,7 @@ Release 的差异，完整改动与验证步骤见同目录的 [`TB320FC-PORT-NO
 - **配套手写笔：联想 AP501U**（商品名 Lenovo Tab Pen Plus，Picasso / LPP+USI2.0）。
   发布给 ColorOS 设置页/设备空间的笔名是 `Lenovo Tab Pen Plus (AP501U)`（`PEN_MODEL_NAME`），
   已配对设备识别关键字包含 `ap501u` / `ap500u` / `tab pen plus` / `picasso`。
-- 内置 Hook 副本（`hook/PenBridge-Hook.apk`）的 DEX 已按本机型与笔型打过补丁并**用新密钥
+- 内置 Hook 副本（`hook/PenBridge-Hook-v4.1.3-TB320FC.apk`）的 DEX 已按本机型与笔型打过补丁并**用新密钥
   重新签名**，详见 `TB320FC-PORT-NOTES.md`；独立安装包见构建输出的 `PenBridge-Hook-v4.1.3-TB320FC.apk`。
 - Hall/CPS/BLE 状态监控与真实磁吸胶囊广播；
 - 开机按已绑定手写笔地址调用原厂 CoreService `CONNECT_PENCIL`，不以磁吸为前提；

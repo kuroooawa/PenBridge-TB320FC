@@ -14,7 +14,7 @@
 | 位置 | 上游 | 本构建 |
 | --- | --- | --- |
 | `service.sh`（Root 服务） | `ro.soc.model` 含 `SM8650Q` 且 `ro.board.platform` 含 `pineapple` | 任一 `ro.product.*` 身份属性含 `TB320FC`（见下） |
-| `hook/PenBridge-Hook.apk` → `DeviceGate.supported()` | 同上两条 SoC 判定 | 已放开（DEX 层面直接返回 true），设备约束由 Root 服务负责 |
+| `hook/PenBridge-Hook-v4.1.3-TB320FC.apk` → `DeviceGate.supported()` | 同上两条 SoC 判定 | 已放开（DEX 层面直接返回 true），设备约束由 Root 服务负责 |
 
 Root 服务检查的属性（空值跳过，大小写不敏感，子串匹配）：
 
@@ -46,7 +46,7 @@ ro.build.product
 已配对笔的选择逻辑（`find_bonded_pen_mac` / `resolve_pen_mac`）不变：优先用
 `ipe_pencil_mac_addr`，失效时按上述名称规则在 `bt_config.conf` 里挑一支笔并把地址写回。
 
-## 3. Hook APK（`hook/PenBridge-Hook.apk`）的 DEX 补丁
+## 3. Hook APK（`hook/PenBridge-Hook-v4.1.3-TB320FC.apk`）的 DEX 补丁
 
 只改 4 处 2 字节指令，不改字符串内容、不增删字符串，APK 布局（各条目偏移、对齐、
 压缩方式）与上游完全一致，只更新 ZIP CRC、DEX 校验和/签名，然后按 **APK Signature
@@ -58,6 +58,7 @@ Scheme v2** 重新签名：
 | P2 | `CardBatteryHooks.refreshPenCard()` | 卡片标题查找串 `Lenovo Tab Pen Pro` → `Lenovo Tab Pen Plus` |
 | P3 | `CardBatteryHooks.collectTextViews()` | `String.equals` → `String.contains`，容忍笔名后的 `(AP501U)` 后缀 |
 | P4 | `LenovoPenUEventBridge.onUEvent()` | uevent 快照的 `name` 附加项键名改掉，笔名交由 Root 服务发布 |
+| P5 | `resources.arsc` 字符串池 | 应用显示名 `联想平板 Pro GT - 手写笔桥接` → `TB320FC - 手写笔桥接 (AP501U)`；模块说明（LSPosed 里显示的 description）→ TB320FC/AP501U 文案。两者都是原地等长改写（label 槽位 37 字节 / 说明槽位 235 字节） |
 
 ### 签名变化（重要）
 
@@ -66,7 +67,7 @@ Scheme v2** 重新签名：
   RSA 2048，自签，仅用于本模块，不是可信密钥）。
 - 因此**必须先卸载旧的 `com.aclaniakea.lenovopenbridge`**，再安装本构建的
   `PenBridge-Hook-v4.1.3-TB320FC.apk`（否则 Android 会因为签名不一致拒绝覆盖安装）。
-  模块内 `hook/PenBridge-Hook.apk` 与这个独立安装包是同一份、同一签名。
+  模块内 `hook/PenBridge-Hook-v4.1.3-TB320FC.apk` 与这个独立安装包是同一份、同一签名。
 - `META-INF/` 里上游的 v1（JAR）签名文件保留原样、内容已过期；平台在有 v2 签名时
   按 v2 校验，不再看 v1，属正常现象。若要一份 v1 也干净的重签产物，用你自己的
   `apksigner`（v2/v3）重签即可，例如：

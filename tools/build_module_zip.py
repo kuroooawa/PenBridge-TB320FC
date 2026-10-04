@@ -28,10 +28,12 @@ DEFAULT_ORDER = [
     "post-fs-data.sh", "service.sh",
     "system/etc/permissions/privapp-permissions-com.aclaniakea.penhidctl.xml",
     "system/priv-app/aclpenhid/PenHidCtl.apk", "uninstall.sh",
-    "bin/lsposed-path-sync.jar", "hook/PenBridge-Hook.apk",
+    "bin/lsposed-path-sync.jar", "hook/PenBridge-Hook-v4.1.3-TB320FC.apk",
     "TB320FC-PORT-NOTES.md",
 ]
 STORE_EXT = (".apk", ".jar", ".zip")
+# 本构建把模块内的 Hook 副本改了文件名；沿用上游同名条目的压缩方式与权限
+RENAMES = {"hook/PenBridge-Hook.apk": "hook/PenBridge-Hook-v4.1.3-TB320FC.apk"}
 
 
 def upstream_layout():
@@ -44,11 +46,13 @@ def upstream_layout():
 def main():
     # keep the module's embedded Hook in sync with the re-signed standalone APK
     if os.path.isfile(HOOK_APK):
-        target = os.path.join(MODULE, "hook", "PenBridge-Hook.apk")
+        target = os.path.join(MODULE, "hook", "PenBridge-Hook-v4.1.3-TB320FC.apk")
         shutil.copyfile(HOOK_APK, target)
-        print("module/hook/PenBridge-Hook.apk <- dist/%s" % os.path.basename(HOOK_APK))
+        print("module/hook/PenBridge-Hook-v4.1.3-TB320FC.apk <- dist/%s" % os.path.basename(HOOK_APK))
 
     up = upstream_layout()
+    if up is not None:
+        up = {RENAMES.get(k, k): v for k, v in up.items()}
     if up is None:
         print("upstream zip not found (%s); using the built-in entry layout" % UPSTREAM_ZIP)
         up = {}
@@ -85,11 +89,11 @@ def main():
         assert bad is None, "zip corrupt at %s" % bad
         names = z.namelist()
         assert names == order, "entry order changed"
-        hook = z.read("hook/PenBridge-Hook.apk")
+        hook = z.read("hook/PenBridge-Hook-v4.1.3-TB320FC.apk")
         print("zip entries: %d, testzip clean" % len(names))
         if os.path.isfile(HOOK_APK):
             standalone = open(HOOK_APK, "rb").read()
-            print("hook/PenBridge-Hook.apk == dist standalone: %s (%d bytes, sha256 %s)"
+            print("hook/PenBridge-Hook-v4.1.3-TB320FC.apk == dist standalone: %s (%d bytes, sha256 %s)"
                   % (hook == standalone, len(hook), hashlib.sha256(hook).hexdigest()[:32]))
 
 

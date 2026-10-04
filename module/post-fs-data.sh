@@ -8,7 +8,7 @@ MODDIR=${0%/*}
 # /data/app paths on this port. Pin the Pen Hook to the signed copy embedded
 # in this KernelSU module before zygote/system_server requests its module list.
 LSP_DB=/data/adb/lspd/config/modules_config.db
-LSP_APK="$MODDIR/hook/PenBridge-Hook.apk"
+LSP_APK="$MODDIR/hook/PenBridge-Hook-v4.1.3-TB320FC.apk"
 LSP_SYNC="$MODDIR/bin/lsposed-path-sync.jar"
 if [ -f "$LSP_DB" ] && [ -f "$LSP_APK" ] && [ -f "$LSP_SYNC" ]; then
     chown 0:0 "$LSP_APK" "$LSP_SYNC"

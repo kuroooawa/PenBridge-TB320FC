@@ -6,7 +6,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 paths = sys.argv[1:] or [
-    os.path.join(ROOT, "module", "hook", "PenBridge-Hook.apk"),
+    os.path.join(ROOT, "module", "hook", "PenBridge-Hook-v4.1.3-TB320FC.apk"),
     os.path.join(ROOT, "dist", "PenBridge-Hook-v4.1.3-TB320FC.apk"),
 ]
 

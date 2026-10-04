@@ -39,6 +39,13 @@ SIG_ALG_RSA_PKCS1_SHA256 = 0x0103
 V2_BLOCK_ID = 0x7109871A
 APK_SIG_BLOCK_MAGIC = b"APK Sig Block 42"
 
+# P5 目标文案：显示名（app label）与模块说明（description）。上游槽位容量为
+# label 37 字节 / description 235 字节（UTF-8），脚本会断言不超限。
+HOOK_LABEL = "TB320FC - 手写笔桥接 (AP501U)"
+HOOK_DESC = ("手写笔桥接（TB320FC/AP501U）：笔身状态与按键、便签工具、书写触感。"
+             "挂住 SystemUI 与便签里判断笔状态的几处，接入桥接服务上报的状态；"
+             "触感页只保留这支笔真能驱动的控件。")
+
 
 # ----------------------------------------------------------------------------- dex parsing
 def uleb128(buf, off):
@@ -225,6 +232,64 @@ def build_signing_block(pair_value):
     return struct.pack("<Q", size) + pair + struct.pack("<Q", size) + APK_SIG_BLOCK_MAGIC
 
 
+def string_pool_slots(buf, off):
+    """Parse a ResStringPool chunk (resources.arsc global pool at offset 12, AXML pool at 8).
+
+    Returns (slots, meta); each slot carries the *byte* offset/length of the string data so a
+    same-or-shorter replacement can be written in place (trailing bytes are zero padding).
+    """
+    ptype, phdr, psize = struct.unpack_from("<HHI", buf, off)
+    assert ptype == 0x0001, "no string pool at 0x%x (type 0x%x)" % (off, ptype)
+    count, style_count, flags, sstart, stystart = struct.unpack_from("<IIIII", buf, off + 8)
+    utf8 = bool(flags & (1 << 8))
+    assert not (flags & 1), "string pool is sorted: in-place rewrite would break ordering"
+    offsets = [struct.unpack_from("<I", buf, off + phdr + 4 * i)[0] for i in range(count)]
+    slots = []
+    for i, o in enumerate(offsets):
+        q = off + sstart + o
+        if utf8:
+            n = buf[q]
+            plen = 1
+            if n & 0x80:
+                n = ((n & 0x7F) << 8) | buf[q + 1]
+                plen = 2
+            q += plen
+            m = buf[q]
+            llen = 1
+            if m & 0x80:
+                m = ((m & 0x7F) << 8) | buf[q + 1]
+                llen = 2
+            q += llen
+            slots.append({"data_start": q, "data_len": m,
+                          "text": buf[q:q + m].decode("utf-8", "replace"),
+                          "prefix": plen + llen, "term": 1})
+        else:
+            n = struct.unpack_from("<H", buf, q)[0]
+            plen = 2
+            q += 2
+            if n & 0x8000:
+                n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", buf, q)[0]
+                plen = 4
+                q += 2
+            slots.append({"data_start": q, "data_len": 2 * n,
+                          "text": buf[q:q + 2 * n].decode("utf-16-le", "replace"),
+                          "prefix": plen, "term": 2})
+    meta = {"utf8": utf8, "count": count, "size": psize, "flags": flags}
+    return slots, meta
+
+
+def rewrite_pool_string(buf, slot, new_text, label):
+    """Rewrite one string pool slot in place; the string must fit into the existing slot."""
+    encoding = "utf-8" if slot["term"] == 1 else "utf-16-le"
+    new_bytes = new_text.encode(encoding)
+    if len(new_bytes) > slot["data_len"]:
+        raise SystemExit("%s: %d bytes needed, only %d available in the slot"
+                         % (label, len(new_bytes), slot["data_len"]))
+    start = slot["data_start"]
+    buf[start:start + slot["data_len"]] = new_bytes + b"\x00" * (slot["data_len"] - len(new_bytes))
+    return len(new_bytes)
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     data = bytearray(open(SRC_APK, "rb").read())
@@ -287,6 +352,38 @@ def main():
     struct.pack_into("<I", data, dex_lh["off"] + 14, new_crc)
     struct.pack_into("<I", data, dex_ce["off"] + 16, new_crc)
     print("classes.dex patched, new crc32=0x%08x" % new_crc)
+
+    # ---- P5: display name (app label) + module description inside resources.arsc.
+    #          resources.arsc is STORED and the replacement keeps the entry's byte length,
+    #          so every entry offset in the APK stays unchanged; only the entry CRC changes.
+    arsc_ce = entries["resources.arsc"]
+    arsc_lh = local_header(bytes(data), arsc_ce["local_off"])
+    arsc_off = arsc_lh["data_off"]
+    arsc_len = arsc_lh["usize"]
+    assert arsc_lh["csize"] == arsc_len and arsc_ce["usize"] == arsc_len, \
+        "resources.arsc must be stored"
+    arsc = bytearray(data[arsc_off:arsc_off + arsc_len])
+    slots, meta = string_pool_slots(arsc, 12)
+    print("resources.arsc string pool: %d strings, utf8=%s, sorted=%s, size=%d"
+          % (meta["count"], meta["utf8"], bool(meta["flags"] & 1), meta["size"]))
+    for idx, new_text, expected_prefix, what in (
+            (9, HOOK_LABEL, "联想平板 Pro GT", "app label"),
+            (8, HOOK_DESC, "手写笔的框架层部分", "module description")):
+        slot = slots[idx]
+        if not slot["text"].startswith(expected_prefix):
+            raise SystemExit("unexpected upstream %s at pool index %d: %r"
+                             % (what, idx, slot["text"]))
+        written = rewrite_pool_string(arsc, slot, new_text, what)
+        print("P5 %s: pool[%d] %d -> %d bytes (slot %d)  %r"
+              % (what, idx, slot["data_len"], written, slot["data_len"], new_text))
+    new_arsc = bytes(arsc)
+    assert len(new_arsc) == arsc_len
+    data[arsc_off:arsc_off + arsc_len] = new_arsc
+    import zlib
+    arsc_crc = zlib.crc32(new_arsc) & 0xFFFFFFFF
+    struct.pack_into("<I", data, arsc_lh["off"] + 14, arsc_crc)
+    struct.pack_into("<I", data, arsc_ce["off"] + 16, arsc_crc)
+    print("resources.arsc patched, new crc32=0x%08x" % arsc_crc)
 
     # ---- re-sign (v2)
     params = {}

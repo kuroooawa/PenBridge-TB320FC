@@ -8,7 +8,7 @@ import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APK = sys.argv[1] if len(sys.argv) > 1 else \
-    os.path.join(ROOT, "module", "hook", "PenBridge-Hook.apk")
+    os.path.join(ROOT, "module", "hook", "PenBridge-Hook-v4.1.3-TB320FC.apk")
 
 d = zipfile.ZipFile(APK).read("classes.dex")
 

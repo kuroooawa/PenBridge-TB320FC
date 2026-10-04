@@ -20,6 +20,7 @@
 | Hook 笔卡片标题匹配 | `Lenovo Tab Pen Pro` + `String.equals` | `Lenovo Tab Pen` + `String.contains`（界面显示带 `(AP501U)` 后缀也能命中） |
 | Hook 内核 uevent 快照的笔名 | 每次都写 `name=Lenovo Tab Pen Pro` | 不再写笔名字段，笔名统一由 Root 服务发布，避免两个发布方互相覆盖 |
 | Hook APK 签名 | 上游作者密钥 | 本构建重新用新密钥按 APK Signature Scheme v2 签名（**安装前必须卸载旧 Hook**） |
+| Hook APK 显示名 / 说明 | `联想平板 Pro GT - 手写笔桥接` + 上游说明文案 | `TB320FC - 手写笔桥接 (AP501U)` + TB320FC/AP501U 文案（`resources.arsc` 原地改写） |
 
 逐项说明、上机验证命令、已知边界见 [`module/TB320FC-PORT-NOTES.md`](module/TB320FC-PORT-NOTES.md)。
 
@@ -27,7 +28,7 @@
 
 ```
 module/                       KernelSU 模块源（service.sh / customize.sh / module.prop / system/ / bin/ / hook/ …）
-  hook/PenBridge-Hook.apk     已打补丁并重签名的 Hook（随模块下发）
+  hook/PenBridge-Hook-v4.1.3-TB320FC.apk     已打补丁并重签名的 Hook（随模块下发）
   TB320FC-PORT-NOTES.md       改动与验证详情
 dist/                         构建产物（可直接安装）
   PenBridge-Module-v4.1.3-TB320FC.zip
@@ -102,8 +103,8 @@ python tools/manifest_dump.py              # 打印 Hook 的 manifest 关键属�
 本仓库当前 `dist/` 产物的 SHA-256：
 
 ```
-PenBridge-Module-v4.1.3-TB320FC.zip   C9855D639EDA4CC75EF83BB6204F9AB4A7AB3BA1293AFFF1656C0C5477C9CB6A
-PenBridge-Hook-v4.1.3-TB320FC.apk     4E3D9B01E948AA8FF742EDC106F6F12EC054EDF90668FFDD9095C9B0873C96E0
+PenBridge-Module-v4.1.3-TB320FC.zip   0ACDBFC1FF4E89BA181787078DA5380EAFC68066EDB7C8C507FF4E8B82ED9C16
+PenBridge-Hook-v4.1.3-TB320FC.apk     61D49B128B9CB49D930B76D579725A2DE278DE609015DD2AE4CBD117EB69E43C
 ```
 
 ## 已知边界（需要上机确认的部分）

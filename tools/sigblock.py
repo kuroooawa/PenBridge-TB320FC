@@ -3,7 +3,7 @@ import struct
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APK = os.environ.get("PENBRIDGE_SRC_APK",
-                    os.path.join(ROOT, "module", "hook", "PenBridge-Hook.apk"))
+                    os.path.join(ROOT, "module", "hook", "PenBridge-Hook-v4.1.3-TB320FC.apk"))
 data = open(APK, 'rb').read()
 
 i = data.rfind(b'PK\x05\x06')

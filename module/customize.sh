@@ -41,17 +41,17 @@ set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 [ -f "$MODPATH/bin/pen-cps-gpio" ] && set_perm "$MODPATH/bin/pen-cps-gpio" 0 0 0755
 [ -f "$MODPATH/bin/lsposed-path-sync.jar" ] && set_perm "$MODPATH/bin/lsposed-path-sync.jar" 0 0 0644
-[ -f "$MODPATH/hook/PenBridge-Hook.apk" ] && set_perm "$MODPATH/hook/PenBridge-Hook.apk" 0 0 0644
+[ -f "$MODPATH/hook/PenBridge-Hook-v4.1.3-TB320FC.apk" ] && set_perm "$MODPATH/hook/PenBridge-Hook-v4.1.3-TB320FC.apk" 0 0 0644
 
 if [ -f /data/adb/lspd/config/modules_config.db ] && \
         [ -f "$MODPATH/bin/lsposed-path-sync.jar" ] && \
-        [ -f "$MODPATH/hook/PenBridge-Hook.apk" ]; then
+        [ -f "$MODPATH/hook/PenBridge-Hook-v4.1.3-TB320FC.apk" ]; then
     chcon u:object_r:system_file:s0 "$MODPATH/bin/lsposed-path-sync.jar" \
-        "$MODPATH/hook/PenBridge-Hook.apk" 2>/dev/null
+        "$MODPATH/hook/PenBridge-Hook-v4.1.3-TB320FC.apk" 2>/dev/null
     CLASSPATH="$MODPATH/bin/lsposed-path-sync.jar" app_process /system/bin \
         com.aclaniakea.tools.LsposedPathSync \
         /data/adb/lspd/config/modules_config.db \
-        "$MODPATH/hook/PenBridge-Hook.apk" \
+        "$MODPATH/hook/PenBridge-Hook-v4.1.3-TB320FC.apk" \
         com.aclaniakea.lenovopenbridge \
         system com.coloros.note com.oplus.exsystemservice \
         com.oplus.healthservice com.heytap.mydevices com.oplus.ipemanager \

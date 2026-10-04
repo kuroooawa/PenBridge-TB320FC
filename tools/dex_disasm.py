@@ -1,7 +1,7 @@
 import struct, zipfile, sys, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APK = os.environ.get("DEX_APK", os.path.join(ROOT, "module", "hook", "PenBridge-Hook.apk"))
+APK = os.environ.get("DEX_APK", os.path.join(ROOT, "module", "hook", "PenBridge-Hook-v4.1.3-TB320FC.apk"))
 d = zipfile.ZipFile(APK).read('classes.dex')
 
 def uleb128(buf, off):
