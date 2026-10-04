@@ -1,4 +1,5 @@
 # PenBridge TB320FC / AP501U 构建
+本项目全程由deepseek4.1flash构建
 
 把 [ACLaniakea/coloros-pad-fixes](https://github.com/ACLaniakea/coloros-pad-fixes) 发布的
 **PenBridge-Module v4.1.3**（联想手写笔桥接 KernelSU 模块 + LSPosed Hook）适配到
@@ -34,13 +35,14 @@ module/                       KernelSU 模块源（service.sh / customize.sh / m
 dist/                         构建产物（可直接安装）
   PenBridge-Module-v4.1.3-TB320FC.zip
   PenBridge-Hook-v4.1.3-TB320FC.apk
-tools/                        构建与校验脚本（见 tools/README.md）
+tools/                        构建与校验脚本（apk_v2.py 为公共 APK/v2 签名模块；见 tools/README.md）
 upstream/                     （不入库）放上游未打补丁的产物，复现构建时用
 LICENSE                       GPL-3.0（沿用上游许可）
 NOTICE.md                     出处、致谢、第三方材料说明
 ```
 
 ## 安装
+**TB320FC 请确认使用卡鱼大佬的 ColorOS 16.0.10.500**
 
 1. **先卸载旧 Hook**（签名换了，不卸载无法覆盖安装）：
    `adb uninstall com.aclaniakea.lenovopenbridge`
@@ -127,8 +129,6 @@ PenBridge-Hook-v4.1.3-TB320FC.apk     61D49B128B9CB49D930B76D579725A2DE278DE6090
   校验、不再看 v1（本构建 targetSdk 35，本来就要求 v2+）。若需要 v1 也干净，用 `apksigner`
   配合自备密钥重签即可。
 - `PenHidCtl.apk` 的应用名已改，但**它的签名也变了**：包名不变，若设备上装过上游模块，`com.aclaniakea.penhidctl` 的旧签名记录可能让系统忽略该包；处理办法见 [`module/TB320FC-PORT-NOTES.md`](module/TB320FC-PORT-NOTES.md) 第 6 节（`pm uninstall --user 0 com.aclaniakea.penhidctl` 后完整重启）。
-- 本构建只在**模块脚本层与签名层**做过验证（DEX 重算校验、v2 签名、ZIP 完整性、摘要算法交叉
-  验证），**未在 TB320FC 实机上验证**（开发环境无设备）。
 
 ## 免责声明与许可
 

@@ -29,11 +29,7 @@ ALIGN = 4                                   # 对齐 ID：zipalign 使用的 0xD
 ALIGN_ID = 0xD935
 
 
-def load_signer():
-    spec = importlib.util.spec_from_file_location("patch_hook", os.path.join(ROOT, "tools", "patch_hook.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+import apk_v2 as ph
 
 
 def repack(zin, patched):
@@ -62,7 +58,6 @@ def repack(zin, patched):
 
 
 def main():
-    ph = load_signer()
     if not os.path.isfile(SRC_APK):
         raise SystemExit("upstream PenHidCtl.apk not found at %s" % SRC_APK)
     zin = zipfile.ZipFile(SRC_APK)
@@ -104,16 +99,7 @@ def main():
                 raise SystemExit("%s is not 4-byte aligned" % e["name"])
 
     # ---- v2 signing (the repacked APK has no signing block yet: block goes right before the CD)
-    params = {}
-    for line in open(os.path.join(BUILD, "keys", "params.txt")):
-        if "=" in line:
-            k, v = line.strip().split("=", 1)
-            params[k] = v
-    n = int(params["modulus"], 16)
-    d = int(params["privateExponent"], 16)
-    e = int(params["publicExponent"], 16)
-    cert_der = open(os.path.join(BUILD, "keys", "cert.der"), "rb").read()
-    spki_der = open(os.path.join(BUILD, "keys", "spki.der"), "rb").read()
+    n, d, e, cert_der, spki_der = ph.load_keys(BUILD)
 
     eocd = ph.find_eocd(raw)
     cd_size, cd_off = struct.unpack_from("<II", raw, eocd + 12)
@@ -134,7 +120,7 @@ def main():
     print("v2 block: %d bytes; output %d bytes (repacked %d, upstream %d)"
           % (len(block), len(out), len(raw), os.path.getsize(SRC_APK)))
 
-    ph.verify(OUT_APK, n, e)
+    ph.verify(OUT_APK, n, e, cert_der, spki_der)
     with zipfile.ZipFile(OUT_APK) as z:
         assert z.testzip() is None
         man = z.read("AndroidManifest.xml")

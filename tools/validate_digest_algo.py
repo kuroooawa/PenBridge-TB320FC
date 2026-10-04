@@ -1,46 +1,31 @@
-"""Cross-check the v2 content-digest implementation against real, properly signed APKs.
+"""Recompute the v2 content digest of signed APKs and compare it with the digest embedded in
+their signing block. Used to cross-check apk_v2 against real apksigner output.
 
-The chunked-digest algorithm must restart chunking at each section boundary
-(entries content / central directory / EOCD). If a recomputed digest equals the digest
-embedded in an APK's v2 signer, our implementation matches apksigner's.
+    python tools/validate_digest_algo.py dist/PenBridge-Hook-v4.1.3-TB320FC.apk [more.apk ...]
 """
-import hashlib
 import struct
 import sys
+import zipfile
 
-MAGIC = b"APK Sig Block 42"
-
-
-def apk_content_digest(sections):
-    chunk = 1024 * 1024
-    chunk_digests = []
-    for section in sections:
-        for i in range(0, len(section), chunk):
-            part = section[i:i + chunk]
-            chunk_digests.append(hashlib.sha256(b"\xa5" + struct.pack("<I", len(part)) + part).digest())
-    h = hashlib.sha256()
-    h.update(b"\x5a" + struct.pack("<I", len(chunk_digests)))
-    for d in chunk_digests:
-        h.update(d)
-    return h.digest()
+import apk_v2
 
 
 def check(path, block_id):
     data = open(path, "rb").read()
-    eocd = data.rfind(b"PK\x05\x06")
+    eocd = apk_v2.find_eocd(data)
     cd_size, cd_off = struct.unpack_from("<II", data, eocd + 12)
-    magic = data.rfind(MAGIC)
+    magic = data.rfind(apk_v2.APK_SIG_BLOCK_MAGIC)
     if magic < 0:
         return "no APK Signing Block"
     size2 = struct.unpack_from("<Q", data, magic - 8)[0]
     start = magic + 16 - size2 - 8
     eocd_virtual = bytearray(data[eocd:])
     struct.pack_into("<I", eocd_virtual, 16, start)
-    digest = apk_content_digest([data[:start], data[cd_off:cd_off + cd_size], bytes(eocd_virtual)])
+    digest = apk_v2.apk_content_digest(
+        [data[:start], data[cd_off:cd_off + cd_size], bytes(eocd_virtual)])
 
     p = start + 8
-    val = None
-    ids = []
+    ids, val = [], None
     while p < magic - 8:
         pair_len = struct.unpack_from("<Q", data, p)[0]
         pid = struct.unpack_from("<I", data, p + 8)[0]
@@ -51,14 +36,13 @@ def check(path, block_id):
     if val is None:
         return "ids=%s (no 0x%x)" % (ids, block_id)
 
-    u32 = lambda b, o: struct.unpack_from("<I", b, o)[0]
-    sd_len = u32(val, 8)
-    sd = val[12:12 + sd_len]
-    d_alg = u32(sd, 8)
-    d_len = u32(sd, 12)
+    sd = val[12:12 + struct.unpack_from("<I", val, 8)[0]]
+    d_alg = struct.unpack_from("<I", sd, 8)[0]
+    d_len = struct.unpack_from("<I", sd, 12)[0]
     embedded = sd[16:16 + d_len]
     return "ids=%s alg=0x%x %s" % (ids, d_alg, "MATCH" if embedded == digest else
-                                   "MISMATCH (recomputed %s, embedded %s)" % (digest.hex()[:20], embedded.hex()[:20]))
+                                   "MISMATCH (recomputed %s, embedded %s)"
+                                   % (digest.hex()[:20], embedded.hex()[:20]))
 
 
 for path in sys.argv[1:]:
