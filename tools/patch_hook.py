@@ -500,9 +500,11 @@ def verify(path, n, e):
         bad = z.testzip()
         assert bad is None, "zip corrupt at %s" % bad
         names = z.namelist()
-        print("verify: zip OK, %d entries, classes.dex=%d bytes, scope.list=%d bytes"
-              % (len(names), z.getinfo("classes.dex").file_size,
-                 z.getinfo("META-INF/xposed/scope.list").file_size))
+        extra = ""
+        if "META-INF/xposed/scope.list" in names:
+            extra = ", scope.list=%d bytes" % z.getinfo("META-INF/xposed/scope.list").file_size
+        print("verify: zip OK, %d entries, classes.dex=%d bytes%s"
+              % (len(names), z.getinfo("classes.dex").file_size, extra))
 
 
 if __name__ == "__main__":

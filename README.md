@@ -21,6 +21,7 @@
 | Hook 内核 uevent 快照的笔名 | 每次都写 `name=Lenovo Tab Pen Pro` | 不再写笔名字段，笔名统一由 Root 服务发布，避免两个发布方互相覆盖 |
 | Hook APK 签名 | 上游作者密钥 | 本构建重新用新密钥按 APK Signature Scheme v2 签名（**安装前必须卸载旧 Hook**） |
 | Hook APK 显示名 / 说明 | `联想平板 Pro GT - 手写笔桥接` + 上游说明文案 | `TB320FC - 手写笔桥接 (AP501U)` + TB320FC/AP501U 文案（`resources.arsc` 原地改写） |
+| PenHidCtl.apk 应用名 | `联想平板 Pro GT - 手写笔系统服务` | `TB320FC - 手写笔系统服务`（manifest 字面量，重打包 + 重签名；包名不变） |
 
 逐项说明、上机验证命令、已知边界见 [`module/TB320FC-PORT-NOTES.md`](module/TB320FC-PORT-NOTES.md)。
 
@@ -77,6 +78,10 @@ pwsh tools/gen_key.ps1
 python tools/patch_hook.py
 #    -> dist/PenBridge-Hook-v4.1.3-TB320FC.apk（同时打印 4 处补丁与签名自检结果）
 
+# 2b) 给 PenHidCtl 改应用名并重签名（会重打包该 APK，保持条目对齐）
+python tools/patch_penhidctl.py
+#    -> dist/PenHidCtl-v4.1.3-TB320FC.apk
+
 # 3) 打包模块（会把 dist 的 Hook 同步进 module/hook/ 再打包）
 python tools/build_module_zip.py
 #    -> dist/PenBridge-Module-v4.1.3-TB320FC.zip
@@ -103,7 +108,7 @@ python tools/manifest_dump.py              # 打印 Hook 的 manifest 关键属�
 本仓库当前 `dist/` 产物的 SHA-256：
 
 ```
-PenBridge-Module-v4.1.3-TB320FC.zip   0ACDBFC1FF4E89BA181787078DA5380EAFC68066EDB7C8C507FF4E8B82ED9C16
+PenBridge-Module-v4.1.3-TB320FC.zip   AA83917BF949ACBE023D081806F2309F689FB3F7124AF87F8657A7098C1CD92E
 PenBridge-Hook-v4.1.3-TB320FC.apk     61D49B128B9CB49D930B76D579725A2DE278DE609015DD2AE4CBD117EB69E43C
 ```
 
@@ -121,6 +126,7 @@ PenBridge-Hook-v4.1.3-TB320FC.apk     61D49B128B9CB49D930B76D579725A2DE278DE6090
 - Hook 的 `META-INF/` 里保留了上游的 v1（JAR）签名文件，内容已过期；平台在有 v2 签名时按 v2
   校验、不再看 v1（本构建 targetSdk 35，本来就要求 v2+）。若需要 v1 也干净，用 `apksigner`
   配合自备密钥重签即可。
+- `PenHidCtl.apk` 的应用名已改，但**它的签名也变了**：包名不变，若设备上装过上游模块，`com.aclaniakea.penhidctl` 的旧签名记录可能让系统忽略该包；处理办法见 [`module/TB320FC-PORT-NOTES.md`](module/TB320FC-PORT-NOTES.md) 第 6 节（`pm uninstall --user 0 com.aclaniakea.penhidctl` 后完整重启）。
 - 本构建只在**模块脚本层与签名层**做过验证（DEX 重算校验、v2 签名、ZIP 完整性、摘要算法交叉
   验证），**未在 TB320FC 实机上验证**（开发环境无设备）。
 

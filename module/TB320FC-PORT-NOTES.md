@@ -59,6 +59,7 @@ Scheme v2** 重新签名：
 | P3 | `CardBatteryHooks.collectTextViews()` | `String.equals` → `String.contains`，容忍笔名后的 `(AP501U)` 后缀 |
 | P4 | `LenovoPenUEventBridge.onUEvent()` | uevent 快照的 `name` 附加项键名改掉，笔名交由 Root 服务发布 |
 | P5 | `resources.arsc` 字符串池 | 应用显示名 `联想平板 Pro GT - 手写笔桥接` → `TB320FC - 手写笔桥接 (AP501U)`；模块说明（LSPosed 里显示的 description）→ TB320FC/AP501U 文案。两者都是原地等长改写（label 槽位 37 字节 / 说明槽位 235 字节） |
+| P6 | `PenHidCtl.apk` 的 `AndroidManifest.xml` | 应用名 `联想平板 Pro GT - 手写笔系统服务` → `TB320FC - 手写笔系统服务`。该串在压缩存储的 manifest 里，无法原地改，改为重打包（条目顺序/压缩方式不变、STORED 条目 4 字节对齐）后重签名 |
 
 ### 签名变化（重要）
 
@@ -122,6 +123,11 @@ adb shell dumpsys bluetooth_manager | grep -i hogp
 - `system/priv-app/aclpenhid/` 与 `customize.sh` 里原先写的 `penhidctl` 目录名不一致，
   本构建把脚本里的路径改成实际目录 `aclpenhid`（仅影响安装提示是否打印；priv-app 扫描
   与 `privapp-permissions` 白名单都按包名走，本来就不受影响）。
+- **`PenHidCtl.apk` 的签名也换了**（只改了应用名）：它的包名不变，但如果你之前装过**上游**模块，
+  系统里 `com.aclaniakea.penhidctl` 记录的还是上游签名，可能被判为签名冲突而忽略该包。
+  处理办法（有 root）：`adb shell su -c 'pm uninstall --user 0 com.aclaniakea.penhidctl'` 然后完整重启，
+  让它按新签名重新扫描；没装过上游模块则无需任何处理。
+  检查：`adb shell pm path com.aclaniakea.penhidctl` 应有输出，logcat 里不应出现 `signatures do not match`。
 
 ## 7. 构建产物与可复现性
 
@@ -130,11 +136,13 @@ adb shell dumpsys bluetooth_manager | grep -i hogp
 | `PenBridge-Module-v4.1.3-TB320FC.zip` | 完整 KernelSU 模块（含打过补丁并重签名的 Hook 副本） |
 | `PenBridge-Hook-v4.1.3-TB320FC.apk` | 独立安装用的 Hook（与模块内副本字节一致） |
 | `build/keys/penbridge-tb320fc.p12` | 本次使用的自签名密钥（口令 `penbridge`） |
-| `build/patch_hook.py` | 打补丁 + 重签名脚本（含自检） |
-| `build/verify_dex.py` | 校验 DEX 校验和/签名、补丁落点、字符串表有序性 |
-| `build/validate_digest_algo.py` | 用真实已签名 APK 交叉验证 v2 内容摘要算法 |
+| `tools/patch_hook.py` | Hook 打补丁 + 重签名脚本（含自检） |
+| `tools/patch_penhidctl.py` | PenHidCtl 改名 + 重打包 + 重签名脚本（含对齐/内容一致性自检） |
+| `dist/PenHidCtl-v4.1.3-TB320FC.apk` | 改名并重签名后的 priv-app（已打进模块 zip） |
+| `tools/verify_dex.py` | 校验 DEX 校验和/签名、补丁落点、字符串表有序性 |
+| `tools/validate_digest_algo.py` | 用真实已签名 APK 交叉验证 v2 内容摘要算法 |
 
-`build/patch_hook.py` 的 v2 摘要算法已用两个真实签名 APK 交叉验证（上游 Hook 本体、
+`tools/patch_hook.py` 的 v2 摘要算法已用两个真实签名 APK 交叉验证（上游 Hook 本体、
 另一个第三方 APK）：重算出的内容摘要与它们签名块里内嵌的摘要逐字节一致，说明本脚本的
 分块摘要实现与 `apksigner` 相同（按"条目内容 / 中央目录 / EOCD（中央目录偏移改为签名块
 起始）"三段分别分块，块摘要 `SHA256(0xa5 || uint32le(块长) || 块)`，总摘要

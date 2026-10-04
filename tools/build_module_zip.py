@@ -27,13 +27,15 @@ DEFAULT_ORDER = [
     "README.md", "action.sh", "bin/pen-cps-gpio", "customize.sh", "module.prop",
     "post-fs-data.sh", "service.sh",
     "system/etc/permissions/privapp-permissions-com.aclaniakea.penhidctl.xml",
-    "system/priv-app/aclpenhid/PenHidCtl.apk", "uninstall.sh",
+    "system/priv-app/aclpenhid/PenHidCtl-v4.1.3-TB320FC.apk", "uninstall.sh",
     "bin/lsposed-path-sync.jar", "hook/PenBridge-Hook-v4.1.3-TB320FC.apk",
     "TB320FC-PORT-NOTES.md",
 ]
 STORE_EXT = (".apk", ".jar", ".zip")
 # 本构建把模块内的 Hook 副本改了文件名；沿用上游同名条目的压缩方式与权限
-RENAMES = {"hook/PenBridge-Hook.apk": "hook/PenBridge-Hook-v4.1.3-TB320FC.apk"}
+RENAMES = {"hook/PenBridge-Hook.apk": "hook/PenBridge-Hook-v4.1.3-TB320FC.apk",
+           "system/priv-app/aclpenhid/PenHidCtl.apk":
+               "system/priv-app/aclpenhid/PenHidCtl-v4.1.3-TB320FC.apk"}
 
 
 def upstream_layout():

@@ -15,7 +15,7 @@ Release 的差异，完整改动与验证步骤见同目录的 [`TB320FC-PORT-NO
 - Hall/CPS/BLE 状态监控与真实磁吸胶囊广播；
 - 开机按已绑定手写笔地址调用原厂 CoreService `CONNECT_PENCIL`，不以磁吸为前提；
 - 设置页断开调用 `DISCONNECT_PENCIL`，由配套 Hook 执行真实 GATT 断开；
-- `PenHidCtl.apk`（priv-app，无启动器）HID 控制辅助；
+- `PenHidCtl-v4.1.3-TB320FC.apk`（priv-app，无启动器，应用名已改为「TB320FC - 手写笔系统服务」）HID 控制辅助；
 - 不监听屏幕状态、不做唤醒回放，状态只跟随真实 Hall/GATT/Root 事件；
   `pen_wakeup_*` 节点只在开机按需写一次；
 - 模块内含与独立安装包同签名的 Hook 副本，只用于 LSPosed 的早期稳定读取；不执行 `pm install`、不覆盖 `/data/app`。

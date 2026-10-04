@@ -26,7 +26,10 @@ rm -rf "$MODPATH/system/priv-app/lenovopenbridge" \
 rm -f "$MODPATH/system/etc/permissions/privapp-permissions-com.aclaniakea.lenovopenbridge.xml" \
       "$MODPATH/system/system_ext/etc/permissions/privapp-permissions-com.aclaniakea.lenovopenbridge.xml" 2>/dev/null
 
-HIDCTL_APK="$MODPATH/system/priv-app/aclpenhid/PenHidCtl.apk"
+# 旧版模块里的 priv-app 文件名已改：若安装器采用合并式安装，先清掉旧文件，
+# 避免同一个包在 priv-app 下出现两份（PackageManager 会报重复包）。
+rm -f "$MODPATH/system/priv-app/aclpenhid/PenHidCtl.apk" 2>/dev/null
+HIDCTL_APK="$MODPATH/system/priv-app/aclpenhid/PenHidCtl-v4.1.3-TB320FC.apk"
 if [ -f "$HIDCTL_APK" ]; then
     # Keep this APK in the module's priv-app overlay. Installing it with
     # `pm install` here would turn it into /data/app and lose the privileged

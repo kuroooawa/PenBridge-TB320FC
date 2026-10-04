@@ -28,7 +28,10 @@
    - `CardBatteryHooks.refreshPenCard()` 的卡片标题查找串 → `Lenovo Tab Pen Plus`；
    - `CardBatteryHooks.collectTextViews()` 的比较由 `String.equals` 改为 `String.contains`；
    - `LenovoPenUEventBridge.onUEvent()` 的 `name` 附加项键名改掉（笔名由 Root 服务发布）；
+   - `resources.arsc` 里的应用显示名与模块说明改成 TB320FC/AP501U 文案；
    - 重新按 APK Signature Scheme v2 签名（新自签密钥，未随仓库分发）。
+5. `module/system/priv-app/aclpenhid/PenHidCtl-v4.1.3-TB320FC.apk`
+   - `AndroidManifest.xml` 的应用名 `联想平板 Pro GT - 手写笔系统服务` → `TB320FC - 手写笔系统服务`（重打包 + 重签名，其余条目与上游逐字节一致）。
    以上均为 2 字节指令级修改，未增删或改写任何 DEX 字符串。
 
 ## 第三方 / 原厂材料
@@ -36,7 +39,7 @@
 仓库与 `dist/` 中包含的二进制来自上游发布或联想原厂运行时，其权利仍归原权利人：
 
 - `module/hook/PenBridge-Hook-v4.1.3-TB320FC.apk`（上游 LSPosed Hook，本仓库改写 DEX 并重签名）
-- `module/system/priv-app/aclpenhid/PenHidCtl.apk`（上游 HID 控制辅助 priv-app）
+- `module/system/priv-app/aclpenhid/PenHidCtl-v4.1.3-TB320FC.apk`（上游 HID 控制辅助 priv-app，本仓库改了应用名并重签名）
 - `module/bin/lsposed-path-sync.jar`（上游 LSPosed 路径同步工具）
 - `module/bin/pen-cps-gpio`（上游编译的 CPS GPIO 占位程序）
 
